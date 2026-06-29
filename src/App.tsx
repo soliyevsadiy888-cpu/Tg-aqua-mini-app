@@ -7425,8 +7425,117 @@ const INIT_ACCOUNTS = [
   { id: "s_tech",   role: "seller",  name: "AquaTech",   phone: "+998 93 300 30 30", region: "Ташкент",   login: "aquatech_uz",    password: "AT5566", active: false, lastLogin: "15.06 · 09:00", tempPass: null },
 ];
 
+// ── Экран «Свяжитесь с нами» для новых курьеров/продавцов ────
+function ContactSupportScreen({ role, onBack }) {
+  const [submitted, setSubmitted] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const C = { bg: "#08131F", card: "#0E2030", border: "#1C3A4A", teal: "#00C9B1", amber: "#F0A93C", text: "#E8F4F8", muted: "#6C8E96", soft: "#9FC4CC", red: "#FF6B6B" };
+  const roleLabel = role === "courier" ? "курьера" : "продавца";
+  const roleIcon  = role === "courier" ? "🏍️" : "🏪";
+  const TG_SUPPORT = "https://t.me/aquauz_support";
+  const ADMIN_TG_ID = "5300621854"; // замените на ваш Telegram ID
+
+  async function handleCallRequest() {
+    setSubmitting(true);
+    try {
+      const tgUser = (window as any).Telegram?.WebApp?.initDataUnsafe?.user;
+      const name = tgUser ? `${tgUser.first_name || ""} ${tgUser.last_name || ""}`.trim() : "Неизвестный";
+      const username = tgUser?.username ? `@${tgUser.username}` : "(без username)";
+      const userId = tgUser?.id || "—";
+      const msg = `📋 *Заявка на доступ — ${role === "courier" ? "Курьер" : "Продавец"}*\n\n👤 Имя: ${name}\n🔗 TG: ${username}\n🆔 ID: ${userId}\n⏰ Время: ${new Date().toLocaleString("ru-RU", { timeZone: "Asia/Tashkent" })}`;
+      await fetch(`https://api.telegram.org/bot7543461671:AAGcb1e0CJqf8L9bIHevtOYwKexT5MnD3tI/sendMessage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chat_id: ADMIN_TG_ID, text: msg, parse_mode: "Markdown" }),
+      });
+    } catch { /* silent */ }
+    setSubmitting(false);
+    setSubmitted(true);
+  }
+
+  if (submitted) {
+    return (
+      <div style={{ minHeight: "100vh", background: C.bg, color: C.text, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", padding: "32px 24px", textAlign: "center" }}>
+        <div style={{ fontSize: 60, marginBottom: 20 }}>✅</div>
+        <div style={{ fontSize: 22, fontWeight: 900, marginBottom: 12 }}>Заявка принята!</div>
+        <div style={{ fontSize: 15, color: C.muted, lineHeight: 1.6, maxWidth: 320 }}>
+          Ваша заявка будет рассмотрена в течение <span style={{ color: C.teal, fontWeight: 700 }}>24 часов</span>.<br /><br />
+          Мы свяжемся с вами и выдадим логин и пароль.
+        </div>
+        <button onClick={onBack} style={{ marginTop: 36, background: C.card, border: `1px solid ${C.border}`, color: C.soft, borderRadius: 14, padding: "13px 32px", fontSize: 15, fontWeight: 700, cursor: "pointer" }}>
+          ← Вернуться
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, color: C.text, display: "flex", flexDirection: "column" }}>
+      {/* Шапка */}
+      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: "16px" }}>
+        <button onClick={onBack} style={{ background: "none", border: "none", color: C.soft, fontSize: 13, cursor: "pointer", padding: 0 }}>← Назад</button>
+      </div>
+
+      <div style={{ flex: 1, display: "flex", flexDirection: "column", justifyContent: "center", padding: "32px 24px" }}>
+        <div style={{ textAlign: "center", marginBottom: 36 }}>
+          <div style={{ fontSize: 52, marginBottom: 8 }}>{roleIcon}</div>
+          <div style={{ fontSize: 9, color: C.amber, fontWeight: 700, letterSpacing: 1.5, textTransform: "uppercase", marginBottom: 4 }}>AquaUZ</div>
+          <div style={{ fontSize: 22, fontWeight: 900 }}>Нет доступа?</div>
+          <div style={{ fontSize: 14, color: C.muted, marginTop: 8, lineHeight: 1.6, maxWidth: 300, margin: "8px auto 0" }}>
+            Чтобы стать {roleLabel} AquaUZ, свяжитесь с нами — мы выдадим вам логин и пароль.
+          </div>
+        </div>
+
+        <div style={{ maxWidth: 360, width: "100%", margin: "0 auto", display: "flex", flexDirection: "column", gap: 14 }}>
+          {/* Написать в Telegram */}
+          <a
+            href={TG_SUPPORT}
+            target="_blank"
+            rel="noreferrer"
+            style={{
+              display: "flex", alignItems: "center", gap: 14,
+              background: "linear-gradient(135deg, #229ED9, #1A7BBD)",
+              borderRadius: 16, padding: "16px 20px", textDecoration: "none",
+              boxShadow: "0 6px 24px #229ED944",
+            }}
+          >
+            <span style={{ fontSize: 28 }}>✈️</span>
+            <div>
+              <div style={{ fontSize: 15, fontWeight: 800, color: "#fff" }}>Написать в Telegram</div>
+              <div style={{ fontSize: 12, color: "rgba(255,255,255,0.7)", marginTop: 2 }}>Поддержка @aquauz_support</div>
+            </div>
+          </a>
+
+          {/* Заявка на звонок */}
+          <button
+            onClick={handleCallRequest}
+            disabled={submitting}
+            style={{
+              display: "flex", alignItems: "center", gap: 14,
+              background: `linear-gradient(135deg, ${C.teal}, #00A896)`,
+              border: "none", borderRadius: 16, padding: "16px 20px",
+              cursor: "pointer", boxShadow: `0 6px 24px ${C.teal}44`,
+              opacity: submitting ? 0.7 : 1,
+            }}
+          >
+            <span style={{ fontSize: 28 }}>📞</span>
+            <div style={{ textAlign: "left" }}>
+              <div style={{ fontSize: 15, fontWeight: 800, color: "#08131F" }}>{submitting ? "Отправляем..." : "Заявка на звонок"}</div>
+              <div style={{ fontSize: 12, color: "#08131F", opacity: 0.7, marginTop: 2 }}>Мы перезвоним вам в течение 24 часов</div>
+            </div>
+          </button>
+
+          <div style={{ textAlign: "center", fontSize: 12, color: C.muted, marginTop: 8 }}>
+            Логин и пароль выдаёт только администратор AquaUZ
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Экран входа для курьера/продавца ─────────────────────────
-function LoginScreen({ role, onBack, onLogin, accounts }) {
+function LoginScreen({ role, onBack, onLogin, accounts, onNoAccess }) {
   const [login,    setLogin]    = useState("");
   const [password, setPassword] = useState("");
   const [showPass, setShowPass] = useState(false);
@@ -7522,11 +7631,10 @@ function LoginScreen({ role, onBack, onLogin, accounts }) {
 
           {/* Подсказка забыл пароль */}
           <div style={{ fontSize: 12, color: C.muted, marginBottom: 20, marginTop: 8 }}>
-            Забыли пароль? Обратитесь к администратору по номеру{" "}
-            <span style={{ color: C.teal, fontWeight: 700 }}>+998 71 200 01 01</span> — он сбросит пароль.
+            Забыли пароль? Обратитесь к администратору — он сбросит пароль.
           </div>
 
-          {/* Кнопка */}
+          {/* Кнопка входа */}
           <button
             onClick={handleLogin}
             disabled={!login.trim() || !password || loading}
@@ -7540,6 +7648,29 @@ function LoginScreen({ role, onBack, onLogin, accounts }) {
             }}
           >
             {loading ? "⏳ Проверяем..." : `Войти как ${roleLabel}`}
+          </button>
+
+          {/* Разделитель */}
+          <div style={{ display: "flex", alignItems: "center", gap: 10, margin: "20px 0 4px" }}>
+            <div style={{ flex: 1, height: 1, background: C.border }} />
+            <span style={{ fontSize: 11, color: C.muted, whiteSpace: "nowrap" }}>Нет доступа?</span>
+            <div style={{ flex: 1, height: 1, background: C.border }} />
+          </div>
+
+          {/* Кнопка «Свяжитесь с нами» */}
+          <button
+            onClick={onNoAccess}
+            style={{
+              width: "100%",
+              background: "transparent",
+              border: `1px solid ${C.border}`,
+              color: C.soft,
+              borderRadius: 14, padding: "13px",
+              fontSize: 14, fontWeight: 700, cursor: "pointer",
+              marginTop: 10,
+            }}
+          >
+            📩 Связаться с нами
           </button>
         </div>
       </div>
@@ -8557,6 +8688,7 @@ export default function App() {
   const [accounts, setAccounts] = useState(INIT_ACCOUNTS);
   const [loggedInAcc, setLoggedInAcc] = useState(null);  // текущий аккаунт курьера/продавца
   const [needChangePwd, setNeedChangePwd] = useState(false); // требуется смена пароля
+  const [noAccessRole, setNoAccessRole] = useState<string|null>(null); // экран «нет доступа»
   const [configuratorOpen, setConfiguratorOpen] = useState(false);
   const [cartOpen, setCartOpen] = useState(false);
   const [orders, setOrders] = useState([]);
@@ -8589,12 +8721,16 @@ export default function App() {
   if (screen === "diary")  return <DiaryScreen onBack={() => setScreen("catalog")} />;
   if (screen === "club")   return <ClubScreen onBack={() => setScreen("catalog")} />;
   if (screen === "seller") {
+    if (noAccessRole === "seller") {
+      return <ContactSupportScreen role="seller" onBack={() => setNoAccessRole(null)} />;
+    }
     if (!loggedInAcc || loggedInAcc.role !== "seller") {
       return (
         <LoginScreen
           role="seller"
           accounts={accounts}
           onBack={() => setScreen("catalog")}
+          onNoAccess={() => setNoAccessRole("seller")}
           onLogin={(acc, needChange) => {
             setLoggedInAcc(acc);
             if (needChange) { setNeedChangePwd(true); } else { setNeedChangePwd(false); }
@@ -8617,12 +8753,16 @@ export default function App() {
   }
 
   if (screen === "courier") {
+    if (noAccessRole === "courier") {
+      return <ContactSupportScreen role="courier" onBack={() => setNoAccessRole(null)} />;
+    }
     if (!loggedInAcc || loggedInAcc.role !== "courier") {
       return (
         <LoginScreen
           role="courier"
           accounts={accounts}
           onBack={() => setScreen("catalog")}
+          onNoAccess={() => setNoAccessRole("courier")}
           onLogin={(acc, needChange) => {
             setLoggedInAcc(acc);
             if (needChange) { setNeedChangePwd(true); } else { setNeedChangePwd(false); }
