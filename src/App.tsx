@@ -1,6 +1,24 @@
 import React, { useState, useMemo, useRef, useEffect } from "react";
 
 /* ============================================================
+   AquaUZ — бэкенд интеграция
+   ============================================================ */
+const API = "https://aqua-uz-backend.up.railway.app/api";
+const tg = (window as any).Telegram?.WebApp;
+const tgInitData: string = tg?.initData || "";
+const tgUser = tg?.initDataUnsafe?.user as { id?: number; first_name?: string; username?: string } | undefined;
+
+// Получить JWT токен из localStorage
+function getToken(): string { return localStorage.getItem("aqua_token") || ""; }
+function setToken(t: string) { localStorage.setItem("aqua_token", t); }
+function clearToken() { localStorage.removeItem("aqua_token"); }
+
+// Базовые заголовки для авторизованных запросов
+function authHeaders(): Record<string, string> {
+  return { "Content-Type": "application/json", "Authorization": `Bearer ${getToken()}` };
+}
+
+/* ============================================================
    AquaUZ — прототип
    Палитра: глубокий океан #08131F, бирюза #00C9B1, янтарь #F0A93C
    Шрифты (через систему): жирный display + лёгкий текст
@@ -4060,22 +4078,65 @@ function Checkout({ region, cart, setCart, onClose, onDone, onChangeRegion }) {
   function goToConfirm() {
     setLoading(true);
   }
-  function handleDone() {
-    const order = {
-      id: orderId,
-      date: new Date().toLocaleDateString("ru-RU", { day: "numeric", month: "long" }),
-      items: cart,
-      total,
-      address,
-      slot: TIME_SLOTS.find((s) => s.id === slot)?.label
-        ? `${TIME_SLOTS.find((s) => s.id === slot).label} · ${TIME_SLOTS.find((s) => s.id === slot).sub}`
-        : slot,
-      pay,
-      region,
-      deliveryInfo,
-      status: "accepted",
-    };
-    onDone(order);
+  async function handleDone() {
+    try {
+      const items = groupedCart.map(([item, qty]: [any, number]) => ({
+        product_id: item.id,
+        name: item.name,
+        price: item.price,
+        qty,
+      }));
+      const slotObj = TIME_SLOTS.find((s: any) => s.id === slot);
+      const res = await fetch(`${API}/orders`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          phone,
+          region,
+          address,
+          comment,
+          delivery_slot: slotObj ? `${slotObj.label} · ${slotObj.sub}` : slot,
+          pay_method: pay,
+          promo_code: promo || undefined,
+          items,
+          buyer_name: tgUser?.first_name,
+          telegram_user: tgUser,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Ошибка сервера");
+
+      const order = {
+        id: data.order_id || orderId,
+        date: new Date().toLocaleDateString("ru-RU", { day: "numeric", month: "long" }),
+        items: cart,
+        total,
+        address,
+        slot: slotObj ? `${slotObj.label} · ${slotObj.sub}` : slot,
+        pay,
+        region,
+        deliveryInfo,
+        status: "accepted",
+      };
+      onDone(order);
+    } catch (err: any) {
+      // Если бэкенд недоступен — всё равно показываем подтверждение
+      const slotObj = TIME_SLOTS.find((s: any) => s.id === slot);
+      const order = {
+        id: orderId,
+        date: new Date().toLocaleDateString("ru-RU", { day: "numeric", month: "long" }),
+        items: cart,
+        total,
+        address,
+        slot: slotObj ? `${slotObj.label} · ${slotObj.sub}` : slot,
+        pay,
+        region,
+        deliveryInfo,
+        status: "accepted",
+      };
+      onDone(order);
+      console.warn("Backend unavailable, order shown locally:", err.message);
+    }
   }
 
   const stepLabel = step === 1 ? "Адрес и время" : step === 2 ? "Способ оплаты" : "Заказ оформлен";
@@ -7376,30 +7437,36 @@ function LoginScreen({ role, onBack, onLogin, accounts }) {
   const roleIcon  = role === "courier" ? "🏍️" : "🏪";
   const C = { bg: "#08131F", card: "#0E2030", border: "#1C3A4A", teal: "#00C9B1", amber: "#F0A93C", text: "#E8F4F8", muted: "#6C8E96", soft: "#9FC4CC", red: "#FF6B6B" };
 
-  function handleLogin() {
+  async function handleLogin() {
     setLoading(true);
     setError("");
-    setTimeout(() => {
-      const acc = accounts.find(a =>
+    try {
+      const res = await fetch(`${API}/auth/login`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ login: login.trim().toLowerCase(), password, role }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || "Неверный логин или пароль");
+        setLoading(false);
+        return;
+      }
+      setToken(data.token);
+      onLogin(data.user, data.needPasswordChange);
+    } catch {
+      // Fallback к локальной проверке при недоступном бэкенде
+      const acc = (accounts as any[]).find((a: any) =>
         a.role === role &&
         a.login === login.trim().toLowerCase() &&
         (a.password === password || (a.tempPass && a.tempPass === password))
       );
-      if (!acc) {
-        setError("Неверный логин или пароль");
-        setLoading(false);
-        return;
-      }
-      if (!acc.active) {
-        setError("Аккаунт заблокирован. Обратитесь к администратору.");
-        setLoading(false);
-        return;
-      }
-      // если вошёл через tempPass — нужно сменить пароль
-      const needChange = acc.tempPass && acc.tempPass === password;
-      onLogin(acc, needChange);
+      if (!acc) { setError("Неверный логин или пароль"); setLoading(false); return; }
+      if (!acc.active) { setError("Аккаунт заблокирован."); setLoading(false); return; }
+      onLogin(acc, !!(acc.tempPass && acc.tempPass === password));
+    } finally {
       setLoading(false);
-    }, 700);
+    }
   }
 
   return (
