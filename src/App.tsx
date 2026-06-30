@@ -4,6 +4,14 @@ import React, { useState, useMemo, useRef, useEffect } from "react";
    AquaMarjon — бэкенд интеграция
    ============================================================ */
 const API = "https://aqua-uz-backend.up.railway.app/api";
+
+// ⚠️ ПЕРЕД ПРОДАКШЕНОМ: offline-фолбэк логина сверяет пароли из INIT_ACCOUNTS
+// (см. ниже) прямо в клиентском бандле — они видны любому, кто откроет devtools.
+// Это нужно только для офлайн-демо без бэкенда. Перед реальным релизом либо
+// поставьте ALLOW_OFFLINE_AUTH_FALLBACK = false (тогда при недоступном API
+// логин просто покажет ошибку, как и должно быть), либо уберите password/
+// tempPass из INIT_ACCOUNTS и переведите её на безопасные мок-данные без секретов.
+const ALLOW_OFFLINE_AUTH_FALLBACK = true;
 const tg = (window as any).Telegram?.WebApp;
 const tgInitData: string = tg?.initData || "";
 const tgUser = tg?.initDataUnsafe?.user as { id?: number; first_name?: string; username?: string } | undefined;
@@ -16,6 +24,396 @@ function clearToken() { localStorage.removeItem("aqua_token"); }
 // Базовые заголовки для авторизованных запросов
 function authHeaders(): Record<string, string> {
   return { "Content-Type": "application/json", "Authorization": `Bearer ${getToken()}` };
+}
+
+/* ------------------------------------------------------------
+   Push-уведомления через Telegram Bot API
+   Реальная отправка сообщения происходит на бэкенде (через
+   bot.sendMessage по telegram_id) — фронтенд лишь сообщает
+   бэкенду «отправь это событие» и хранит/синхронизирует
+   пользовательские настройки уведомлений.
+   ------------------------------------------------------------ */
+type NotifType = "water_reminder" | "order_status" | "new_arrival" | "subscription_due" | "badge_progress" | "inactivity_reminder";
+
+async function notifyTelegram(type: NotifType, payload: Record<string, any> = {}) {
+  if (!tgUser?.id) return false; // вне Telegram WebApp пушить некому
+  try {
+    const res = await fetch(`${API}/notifications/notify`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ telegram_id: tgUser.id, type, payload }),
+    });
+    return res.ok;
+  } catch {
+    return false; // офлайн/бэкенд недоступен — не блокируем UI
+  }
+}
+
+type NotifPrefs = { water: boolean; delivery: boolean; arrivals: boolean };
+const DEFAULT_NOTIF_PREFS: NotifPrefs = { water: true, delivery: true, arrivals: true };
+
+async function syncNotifPrefs(prefs: NotifPrefs) {
+  if (!tgUser?.id) return;
+  try {
+    await fetch(`${API}/notifications/preferences`, {
+      method: "POST",
+      headers: authHeaders(),
+      body: JSON.stringify({ telegram_id: tgUser.id, prefs }),
+    });
+  } catch {}
+}
+
+/* ============================================================
+   🏷️ Промокоды — бэкенд-валидация
+   ============================================================ */
+type PromoType = "percent" | "fixed" | "free_delivery";
+
+interface PromoResult {
+  code: string;
+  type: PromoType;
+  value: number;
+  label: string;
+}
+
+function calcPromoSavings(
+  result: PromoResult | null,
+  subtotal: number,
+  baseDelivery: number,
+): { discount: number; delivery: number } {
+  if (!result) return { discount: 0, delivery: baseDelivery };
+  switch (result.type) {
+    case "percent":
+      return { discount: Math.round(subtotal * result.value / 100), delivery: baseDelivery };
+    case "fixed":
+      return { discount: Math.min(result.value, subtotal), delivery: baseDelivery };
+    case "free_delivery":
+      return { discount: 0, delivery: 0 };
+    default:
+      return { discount: 0, delivery: baseDelivery };
+  }
+}
+
+function promoErrorMessage(serverError: string): string {
+  switch (serverError) {
+    case "PROMO_NOT_FOUND":      return "Промокод не найден";
+    case "PROMO_EXPIRED":        return "Срок действия промокода истёк";
+    case "PROMO_USED":           return "Промокод уже использован";
+    case "PROMO_LIMIT_REACHED":  return "Промокод больше не действует (лимит исчерпан)";
+    case "PROMO_MIN_ORDER":      return "Сумма заказа слишком мала для этого промокода";
+    case "PROMO_WRONG_SEGMENT":  return "Этот промокод недоступен для вашего аккаунта";
+    default:                     return "Не удалось применить промокод — попробуйте позже";
+  }
+}
+
+// Старые локальные промокоды (AQUA10 / FISH20 / NEWFISH, см. CHECKOUT_PROMOS ниже
+// по файлу) — используются только как офлайн-фолбэк, если бэкенд недоступен
+// (упала сеть/таймаут/5xx). Когда бэкенд гарантированно жив — этот блок можно убрать.
+function legacyPromoFallback(key: string, subtotal: number): { result?: PromoResult; error?: string } {
+  const percent = (CHECKOUT_PROMOS as Record<string, number>)[key];
+  if (percent == null) return { error: "Промокод не найден" };
+  return {
+    result: {
+      code: key,
+      type: "percent",
+      value: percent,
+      label: `−${percent}% (офлайн-режим)`,
+    },
+  };
+}
+
+/* ------------------------------------------------------------
+   🎁 Промокоды-награды за достижения дневника
+   Реальная мотивация: разблокированный бейдж дневника даёт
+   рабочий промокод в магазине (а не просто виртуальную плашку).
+   Храним их локально — это персональные награды пользователя,
+   а не серверные акции, поэтому проверяем их ДО похода в бэкенд.
+   ------------------------------------------------------------ */
+/* ------------------------------------------------------------
+   🤝 Реферальная программа — «Пригласи друга, оба получите промокод».
+   Переиспользует тот же движок наград, что и бейджи дневника
+   (unlockAchievementPromo/getRewardPromos), просто под виртуальным
+   «бейджем» referral — единая система хранения, единая проверка
+   usedAt/minOrderSum при оплате.
+   ------------------------------------------------------------ */
+const REFERRAL_BADGE = { id: "referral", title: "Приведи друга", icon: "🤝" };
+const MY_REFERRAL_CODE_KEY = "aqua_my_referral_code";
+const REDEEMED_REFERRALS_KEY = "aqua_redeemed_referral_codes";
+
+function getMyReferralCode(): string {
+  let code = readLocal(MY_REFERRAL_CODE_KEY, null);
+  if (!code) {
+    code = "FRIEND-" + Math.random().toString(36).slice(2, 7).toUpperCase();
+    writeLocal(MY_REFERRAL_CODE_KEY, code);
+  }
+  return code;
+}
+
+// Активирует чужой реферальный код: текущий пользователь получает промокод-награду.
+// В реальном бэкенде это также начислило бы промокод владельцу кода — здесь,
+// в локальном прототипе без серверных аккаунтов, мы честно показываем это
+// в тексте подсказки, а не делаем вид, что наградили и друга тоже.
+function redeemReferralCode(code: string): { ok: boolean; error?: string; reward?: any } {
+  const key = code.trim().toUpperCase();
+  if (!key) return { ok: false, error: "Введите код друга" };
+  if (key === getMyReferralCode()) return { ok: false, error: "Это ваш собственный код" };
+  const redeemed = readLocal(REDEEMED_REFERRALS_KEY, []);
+  if (redeemed.includes(key)) return { ok: false, error: "Вы уже активировали реферальный код" };
+  writeLocal(REDEEMED_REFERRALS_KEY, [...redeemed, key]);
+  const reward = unlockAchievementPromo(REFERRAL_BADGE, 1); // тир «серебро» — 10%, от 150 000 сум
+  return { ok: true, reward };
+}
+
+const ACHIEVEMENT_PROMO_KEY = "aqua_diary_reward_promos";
+const ACHIEVEMENT_PROMO_PERCENTS = [5, 10, 15]; // по тиру: бронза/серебро/золото
+// Минимальная сумма заказа для применения награды — растёт вместе с тиром,
+// иначе −15% можно слить на самый дешёвый товар в корзине и уйти в минус по марже.
+const ACHIEVEMENT_PROMO_MIN_ORDER = [50000, 150000, 300000]; // сум, по тиру: бронза/серебро/золото
+
+function diaryAchievementPromoCode(badgeId: string, tierIndex: number): string {
+  const tierLetter = ["B", "S", "G"][tierIndex] || "B";
+  return `AQUA-${badgeId.toUpperCase().slice(0, 8)}-${tierLetter}`;
+}
+
+function getRewardPromos(): Record<string, { percent: number; label: string; badgeId: string; tierIndex: number; usedAt: string | null; minOrderSum: number }> {
+  return readLocal(ACHIEVEMENT_PROMO_KEY, {});
+}
+
+// Сохраняет новый промокод-награду за бейдж (если такого ещё нет) и возвращает его
+function unlockAchievementPromo(badge: { id: string; title: string; icon: string }, tierIndex: number) {
+  const code = diaryAchievementPromoCode(badge.id, tierIndex);
+  const promos = getRewardPromos();
+  if (!promos[code]) {
+    const percent = ACHIEVEMENT_PROMO_PERCENTS[tierIndex] ?? 5;
+    const minOrderSum = ACHIEVEMENT_PROMO_MIN_ORDER[tierIndex] ?? 50000;
+    promos[code] = {
+      percent,
+      label: `${badge.icon} Награда за «${badge.title}» (${TIER_NAMES[tierIndex]})`,
+      badgeId: badge.id,
+      tierIndex,
+      usedAt: null,
+      minOrderSum,
+    };
+    writeLocal(ACHIEVEMENT_PROMO_KEY, promos);
+  }
+  return { code, ...promos[code] };
+}
+
+// Отмечает промокод-награду как использованный — вызывается при успешном
+// оформлении заказа, чтобы код нельзя было применить повторно (одноразовость).
+function markRewardPromoUsed(code: string) {
+  const key = code.trim().toUpperCase();
+  const promos = getRewardPromos();
+  if (promos[key] && !promos[key].usedAt) {
+    promos[key] = { ...promos[key], usedAt: new Date().toISOString() };
+    writeLocal(ACHIEVEMENT_PROMO_KEY, promos);
+  }
+}
+
+async function applyPromoImpl(
+  code: string,
+  subtotal: number,
+  userId: number | undefined,
+  signal: AbortSignal,
+): Promise<{ result?: PromoResult; error?: string }> {
+  const key = code.trim().toUpperCase();
+  if (!key) return { error: "Введите промокод" };
+
+  // Сначала проверяем личные промокоды-награды за достижения дневника —
+  // они не существуют на бэкенде, поэтому их нужно ловить раньше сетевого запроса.
+  const rewardPromos = getRewardPromos();
+  if (rewardPromos[key]) {
+    const r = rewardPromos[key];
+    if (r.usedAt) {
+      return { error: promoErrorMessage("PROMO_USED") };
+    }
+    if (r.minOrderSum && subtotal < r.minOrderSum) {
+      return { error: `Минимальная сумма заказа для этого промокода — ${r.minOrderSum.toLocaleString("ru-RU")} сум` };
+    }
+    return {
+      result: {
+        code: key,
+        type: "percent",
+        value: r.percent,
+        label: `−${r.percent}% · награда за достижение 🏅`,
+      },
+    };
+  }
+
+  let res: Response;
+  try {
+    res = await fetch(`${API}/promos/validate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code: key, cart_total: subtotal, user_id: userId }),
+      signal,
+    });
+  } catch (e: any) {
+    if (e?.name === "AbortError") throw e;
+    // Сеть недоступна — пробуем старый локальный список промокодов,
+    // чтобы не ломать чекаут.
+    return legacyPromoFallback(key, subtotal);
+  }
+
+  if (!res.ok) {
+    // Бэкенд ответил, но с ошибкой 5xx (а не «промокод неверный») — тоже
+    // пробуем офлайн-фолбэк перед тем как сдаться.
+    if (res.status >= 500) return legacyPromoFallback(key, subtotal);
+    const data = await res.json().catch(() => ({}));
+    return { error: promoErrorMessage(data.error || "") };
+  }
+
+  const data = await res.json();
+  const type: PromoType = data.type;
+  const value: number = data.value ?? 0;
+  let label: string;
+  switch (type) {
+    case "percent":        label = `−${value}%`; break;
+    case "fixed":          label = `−${value.toLocaleString("ru-RU")} сум`; break;
+    case "free_delivery":  label = "Доставка бесплатно 🚚"; break;
+    default:                label = "Скидка применена";
+  }
+  return { result: { code: key, type, value, label } };
+}
+
+function PromoSpinner() {
+  return (
+    <>
+      <style>{`@keyframes aquaSpin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`}</style>
+      <span style={{
+        display: "inline-block", width: 14, height: 14,
+        border: "2px solid #1C3A4A", borderTopColor: "#00C9B1",
+        borderRadius: "50%", animation: "aquaSpin 0.65s linear infinite",
+      }} />
+      <span>Проверяем…</span>
+    </>
+  );
+}
+
+function PromoField({ subtotal, userId, promoResult, onApply }: {
+  subtotal: number; userId?: number;
+  promoResult: PromoResult | null;
+  onApply: (r: PromoResult | null) => void;
+}) {
+  const [input, setInput] = useState(promoResult?.code ?? "");
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState("");
+  const abortRef = useRef<AbortController | null>(null);
+
+  const applied = promoResult !== null;
+
+  async function handleApply() {
+    if (loading) return;
+    abortRef.current?.abort();
+    const ctrl = new AbortController();
+    abortRef.current = ctrl;
+    setLoading(true);
+    setErr("");
+    try {
+      const { result, error } = await applyPromoImpl(input, subtotal, userId, ctrl.signal);
+      if (error) {
+        setErr(error);
+        onApply(null);
+      } else if (result) {
+        onApply(result);
+        setErr("");
+      }
+    } catch (e: any) {
+      if (e.name === "AbortError") return;
+      setErr("Нет соединения. Проверьте интернет и попробуйте снова.");
+      onApply(null);
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  function handleReset() {
+    setInput("");
+    setErr("");
+    onApply(null);
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent) {
+    if (e.key === "Enter") handleApply();
+  }
+
+  const borderColor = err ? "#FF6B6B" : applied ? "#4ADE80" : "#1C3A4A";
+
+  return (
+    <CkField label="Промокод">
+      <div style={{ display: "flex", gap: 8 }}>
+        <input
+          value={input}
+          onChange={(e) => {
+            setInput(e.target.value);
+            setErr("");
+            if (applied) onApply(null);
+          }}
+          onKeyDown={handleKeyDown}
+          disabled={loading}
+          placeholder="Напр.: AQUA10"
+          style={{
+            flex: 1, background: "#102433", border: `1px solid ${borderColor}`,
+            borderRadius: 12, padding: "11px 14px", color: "#E8F4F8", fontSize: 14,
+            outline: "none", textTransform: "uppercase", opacity: loading ? 0.6 : 1,
+            transition: "border-color 0.15s, opacity 0.15s",
+          }}
+        />
+        {applied ? (
+          <button onClick={handleReset} style={{
+            flexShrink: 0, background: "#1C1414", border: "1px solid #FF6B6B",
+            borderRadius: 12, padding: "11px 14px", color: "#FF6B6B",
+            fontSize: 13, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap",
+          }}>✕ Убрать</button>
+        ) : (
+          <button onClick={handleApply} disabled={loading || !input.trim()} style={{
+            flexShrink: 0, background: loading || !input.trim() ? "#0B1B28" : "#0F2A26",
+            border: `1px solid ${loading || !input.trim() ? "#1C3A4A" : "#00C9B1"}`,
+            borderRadius: 12, padding: "11px 16px", color: loading || !input.trim() ? "#6C8E96" : "#00C9B1",
+            fontSize: 13, fontWeight: 700, cursor: loading || !input.trim() ? "default" : "pointer",
+            minWidth: 96, transition: "all 0.15s", display: "flex", alignItems: "center",
+            justifyContent: "center", gap: 6,
+          }}>
+            {loading ? <PromoSpinner /> : "Применить"}
+          </button>
+        )}
+      </div>
+      {err && (
+        <div style={{ fontSize: 11, color: "#FF6B6B", marginTop: 5, display: "flex", alignItems: "center", gap: 4 }}>
+          <span>⚠</span> {err}
+        </div>
+      )}
+      {!applied && !err && (() => {
+        const rewardCodes = Object.keys(getRewardPromos());
+        if (rewardCodes.length === 0) return null;
+        return (
+          <div style={{ fontSize: 11, color: Dp.muted, marginTop: 6 }}>
+            🎁 У вас есть {rewardCodes.length} промокод{rewardCodes.length === 1 ? "" : "а"} за достижения в 📔 Дневнике — введите его выше
+          </div>
+        );
+      })()}
+      {applied && promoResult && (
+        <div style={{
+          marginTop: 8, background: "#071C14", border: "1px solid #00C9B133",
+          borderRadius: 10, padding: "10px 12px", display: "flex",
+          alignItems: "center", justifyContent: "space-between",
+        }}>
+          <div>
+            <div style={{ fontSize: 12, color: "#4ADE80", fontWeight: 700 }}>✓ Промокод применён</div>
+            <div style={{ fontSize: 13, color: "#E8F4F8", marginTop: 2 }}>{promoResult.label}</div>
+          </div>
+          <span style={{
+            fontSize: 11, background: "#0F2A26", border: "1px solid #00C9B133",
+            borderRadius: 8, padding: "3px 8px", color: "#00C9B1", fontFamily: "monospace",
+          }}>{promoResult.code}</span>
+        </div>
+      )}
+      {!applied && !err && (
+        <div style={{ fontSize: 11, color: "#6C8E96", marginTop: 6 }}>
+          Код выдаётся при первом заказе, через Telegram или реферальную программу
+        </div>
+      )}
+    </CkField>
+  );
 }
 
 /* ============================================================
@@ -311,6 +709,75 @@ const FISH_DB = [
     goal: ["beauty"],
     difficulty: "hard",
   },
+  {
+    id: "swordtail_red",
+    type: "fish",
+    name: "Меченосец «Красный»",
+    latin: "Xiphophorus hellerii",
+    price: 18000,
+    rating: 4.8,
+    reviews: 64,
+    temp: [22, 28],
+    temper: "peaceful",
+    size: "small",
+    origin: "local",
+    avoid: ["betta"],
+    img: "🗡️",
+    color: "#E14B4B",
+    badges: ["🌱 Легко", "🏠 Местная"],
+    about: "Узнаваема по «мечу» — вытянутому нижнему лучу хвостового плавника у самцов. Размер до 8 см, живёт 3–5 лет. Активна и неприхотлива.",
+    origin_story: "🏠 Выращена у нас в Ташкенте. Уже привыкла к местной воде — легко приживётся в вашем аквариуме.",
+    pro: "pH 7.0–8.2 · dGH 10–20 · NH₃ 0 мг/л · мин. объём 60 л",
+    minVolume: 60,
+    goal: ["beauty", "pets", "breeding"],
+    difficulty: "easy",
+  },
+  {
+    id: "swordtail_black",
+    type: "fish",
+    name: "Меченосец «Чёрный бархат»",
+    latin: "Xiphophorus hellerii var.",
+    price: 22000,
+    rating: 4.7,
+    reviews: 39,
+    temp: [22, 28],
+    temper: "peaceful",
+    size: "small",
+    origin: "local",
+    avoid: ["betta"],
+    img: "🗡️",
+    color: "#2B2B2B",
+    badges: ["🌱 Легко", "🏠 Местная"],
+    about: "Бархатно-чёрный окрас по всему телу, контрастный «меч» на хвосте. Размер до 8 см, живёт 3–5 лет. Мирная, хорошо смотрится стайкой.",
+    origin_story: "🏠 Выращена у нас в Ташкенте. Уже привыкла к местной воде — легко приживётся в вашем аквариуме.",
+    pro: "pH 7.0–8.2 · dGH 10–20 · NH₃ 0 мг/л · мин. объём 60 л",
+    minVolume: 60,
+    goal: ["beauty", "pets"],
+    difficulty: "easy",
+  },
+  {
+    id: "swordtail_indo_green",
+    type: "fish",
+    name: "Меченосец «Индонезийский зелёный»",
+    latin: "Xiphophorus hellerii var.",
+    price: 35000,
+    rating: 4.9,
+    reviews: 21,
+    temp: [22, 28],
+    temper: "peaceful",
+    size: "small",
+    origin: "import",
+    avoid: ["betta"],
+    img: "🗡️",
+    color: "#3CA96A",
+    badges: ["✈️ Привозная", "🔴 Редкая"],
+    about: "Редкая привозная форма с зеленовато-оливковым отливом и длинным «мечом». Размер до 9 см, живёт 3–5 лет.",
+    origin_story: "🌏 Привезена из питомника Юго-Восточной Азии. Прошла карантин 14 дней — здоровая и готова к новому дому.",
+    pro: "pH 7.0–8.2 · dGH 10–20 · NH₃ 0 мг/л · мин. объём 80 л",
+    minVolume: 80,
+    goal: ["beauty"],
+    difficulty: "medium",
+  },
 ];
 
 // Оборудование, корм и растения — товары без AI-совместимости рыб,
@@ -517,15 +984,11 @@ const TYPE_TABS = [
 
 const CATEGORIES = [
   { id: "all", label: "Все" },
-  { id: "peaceful", label: "🕊️ Мирные" },
-  { id: "aggressive", label: "⚔️ Хищники" },
-  { id: "swordtail", label: "🗡️ Меченосцы" },
-  { id: "neon", label: "💎 Неоны" },
-  { id: "molly", label: "🖤 Молинезии" },
-  { id: "cupid", label: "💘 Купидоны" },
-  { id: "kids", label: "🧒 Для детей" },
-  { id: "local", label: "🏠 Местные" },
-  { id: "import", label: "✈️ Привозные" },
+  { id: "peaceful", label: "Мирные" },
+  { id: "aggressive", label: "Хищники" },
+  { id: "kids", label: "Для детей" },
+  { id: "local", label: "Местные" },
+  { id: "import", label: "Привозные" },
 ];
 
 function formatSum(n) {
@@ -556,6 +1019,44 @@ function hashStr(str) {
   let h = 0;
   for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) >>> 0;
   return h;
+}
+
+// Расширяем "new_arrival" с общих новинок на конкретные позиции из вишлиста:
+// сравниваем цену/наличие на момент добавления в избранное с актуальными
+// данными FISH_DB и шлём точечный пуш «эта рыба подешевела / снова в наличии»,
+// а не только общую рассылку о новых поступлениях.
+const WISHLIST_NOTIFIED_KEY = "aqua_wishlist_notified_changes";
+
+function getWishlistAlerts(wishlist) {
+  const alerts = [];
+  for (const item of wishlist || []) {
+    const live = FISH_DB.find((f) => f.id === item.id);
+    if (!live) continue;
+    if (live.price < item.price) {
+      alerts.push({ item, live, type: "price_drop", pct: Math.round((1 - live.price / item.price) * 100) });
+    }
+    const wasOut = item.stock === 0 || item.outOfStock === true;
+    const nowIn = getStock(live) > 0;
+    if (wasOut && nowIn) {
+      alerts.push({ item, live, type: "restock" });
+    }
+  }
+  return alerts;
+}
+
+async function notifyWishlistAlerts(wishlist) {
+  const alerts = getWishlistAlerts(wishlist);
+  if (alerts.length === 0) return;
+  const notified = readLocal(WISHLIST_NOTIFIED_KEY, {});
+  for (const a of alerts) {
+    const dedupeKey = `${a.item.id}:${a.type}:${a.type === "price_drop" ? a.live.price : "in"}`;
+    if (notified[dedupeKey]) continue;
+    const ok = await notifyTelegram("new_arrival", a.type === "price_drop"
+      ? { name: a.live.name, price: a.live.price, oldPrice: a.item.price, emoji: a.live.img, reason: "price_drop" }
+      : { name: a.live.name, price: a.live.price, emoji: a.live.img, reason: "restock" });
+    if (ok) notified[dedupeKey] = true;
+  }
+  writeLocal(WISHLIST_NOTIFIED_KEY, notified);
 }
 
 function getStock(fish) {
@@ -1223,6 +1724,9 @@ function Welcome({ onNext }) {
         }}
       >
         AquaMarjon
+      </h1>
+      <p style={{ fontSize: 15, color: "#9FC4CC", maxWidth: 280, lineHeight: 1.5, marginBottom: 28 }}>
+        Живые рыбы. Честные цены.<br />Доставка сегодня.
       </p>
 
       <div style={{ display: "flex", gap: 18, marginBottom: 36 }}>
@@ -1458,23 +1962,32 @@ function AquariumVisualizer({ cart, allFish }) {
 /* ============================================================
    WOW-ФИЧА 2: Сравнение рыб — модальное окно таблицы
    ============================================================ */
-function CompareModal({ fishA, fishB, onClose }) {
-  if (!fishA || !fishB) return null;
+function CompareModal({ fishes, onClose, onRemove }) {
+  const list = (fishes || []).filter(Boolean);
+  if (list.length < 2) return null;
+  const sizeLabel = (f) => f.size === "small" ? "Мелкая" : f.size === "medium" ? "Средняя" : "Крупная";
+  const temperLabel = (f) => f.temper === "peaceful" ? "Мирная" : f.temper === "aggressive" ? "Хищная" : "Полумирная";
+  const diffLabel = (f) => f.difficulty === "easy" ? "🌱 Легко" : f.difficulty === "medium" ? "🟡 Средне" : "🔴 Сложно";
+  const originLabel = (f) => f.origin === "local" ? "🏠 Местная" : "✈️ Привозная";
   const rows = [
-    { label: "Цена", a: formatSum(fishA.price), b: formatSum(fishB.price) },
-    { label: "Рейтинг", a: `⭐ ${fishA.rating}`, b: `⭐ ${fishB.rating}` },
-    { label: "Размер", a: fishA.size === "small" ? "Мелкая" : fishA.size === "medium" ? "Средняя" : "Крупная",
-                       b: fishB.size === "small" ? "Мелкая" : fishB.size === "medium" ? "Средняя" : "Крупная" },
-    { label: "Темперамент", a: fishA.temper === "peaceful" ? "Мирная" : fishA.temper === "aggressive" ? "Хищная" : "Полумирная",
-                            b: fishB.temper === "peaceful" ? "Мирная" : fishB.temper === "aggressive" ? "Хищная" : "Полумирная" },
-    { label: "Температура", a: `${fishA.temp[0]}–${fishA.temp[1]}°C`, b: `${fishB.temp[0]}–${fishB.temp[1]}°C` },
-    { label: "Мин. объём", a: `${fishA.minVolume} л`, b: `${fishB.minVolume} л` },
-    { label: "Сложность", a: fishA.difficulty === "easy" ? "🌱 Легко" : fishA.difficulty === "medium" ? "🟡 Средне" : "🔴 Сложно",
-                          b: fishB.difficulty === "easy" ? "🌱 Легко" : fishB.difficulty === "medium" ? "🟡 Средне" : "🔴 Сложно" },
-    { label: "Происхождение", a: fishA.origin === "local" ? "🏠 Местная" : "✈️ Привозная",
-                              b: fishB.origin === "local" ? "🏠 Местная" : "✈️ Привозная" },
+    { label: "Цена", get: (f) => formatSum(f.price) },
+    { label: "Рейтинг", get: (f) => `⭐ ${f.rating}` },
+    { label: "Размер", get: sizeLabel },
+    { label: "Темперамент", get: temperLabel },
+    { label: "Температура", get: (f) => `${f.temp[0]}–${f.temp[1]}°C` },
+    { label: "Мин. объём", get: (f) => `${f.minVolume} л` },
+    { label: "Сложность", get: diffLabel },
+    { label: "Происхождение", get: originLabel },
   ];
-  const compat = checkCompatibility(fishA, [fishB]);
+  // Совместимость каждой пары
+  const pairWarnings = [];
+  for (let i = 0; i < list.length; i++) {
+    for (let j = i + 1; j < list.length; j++) {
+      const c = checkCompatibility(list[i], [list[j]]);
+      if (c.level !== "ok") pairWarnings.push({ a: list[i], b: list[j], c });
+    }
+  }
+  const gridCols = `90px repeat(${list.length}, 1fr)`;
   return (
     <div style={{
       position: "fixed", inset: 0, background: "rgba(5,10,16,0.85)",
@@ -1487,41 +2000,51 @@ function CompareModal({ fishA, fishB, onClose }) {
       }}>
         {/* Header */}
         <div style={{ padding: "18px 18px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div style={{ fontSize: 15, fontWeight: 800 }}>⚖️ Сравнение рыб</div>
+          <div style={{ fontSize: 15, fontWeight: 800 }}>⚖️ Сравнение рыб ({list.length})</div>
           <button onClick={onClose} style={{ background: "none", border: "none", color: "#6C8E96", fontSize: 20, cursor: "pointer" }}>✕</button>
         </div>
         {/* Fish heads */}
-        <div style={{ display: "grid", gridTemplateColumns: "auto 1fr 1fr", gap: 0, padding: "14px 18px 0" }}>
+        <div style={{ display: "grid", gridTemplateColumns: gridCols, gap: 0, padding: "14px 18px 0", overflowX: "auto" }}>
           <div />
-          {[fishA, fishB].map(fish => (
-            <div key={fish.id} style={{ textAlign: "center", padding: "0 4px" }}>
-              <div style={{ fontSize: 36 }}>{fish.img}</div>
-              <div style={{ fontSize: 11, fontWeight: 700, lineHeight: 1.3, marginTop: 4, color: "#E8F4F8" }}>{fish.name}</div>
+          {list.map(fish => (
+            <div key={fish.id} style={{ textAlign: "center", padding: "0 4px", position: "relative" }}>
+              {onRemove && list.length > 2 && (
+                <button onClick={() => onRemove(fish.id)} style={{ position: "absolute", top: -6, right: 2, background: "#1C3A4A", border: "none", borderRadius: "50%", width: 16, height: 16, color: "#9FC4CC", fontSize: 10, cursor: "pointer", lineHeight: "16px", padding: 0 }}>✕</button>
+              )}
+              <div style={{ fontSize: 32 }}>{fish.img}</div>
+              <div style={{ fontSize: 10.5, fontWeight: 700, lineHeight: 1.3, marginTop: 4, color: "#E8F4F8" }}>{fish.name}</div>
             </div>
           ))}
         </div>
-        {/* Compat banner */}
-        <div style={{
-          margin: "12px 18px",
-          background: compat.level === "bad" ? "#2A1414" : compat.level === "warn" ? "#1E1800" : "#071C14",
-          border: `1px solid ${compat.level === "bad" ? "#FF6B6B" : compat.level === "warn" ? "#F0A93C" : "#00C9B1"}`,
-          borderRadius: 10, padding: "8px 12px", fontSize: 12, textAlign: "center",
-          color: compat.level === "bad" ? "#FF6B6B" : compat.level === "warn" ? "#F0A93C" : "#00C9B1",
-          fontWeight: 600,
-        }}>
-          {compat.level === "bad" ? `⚠️ ${compat.reason}` : compat.level === "warn" ? `🟡 ${compat.reason}` : "✅ Отлично уживутся вместе в одном аквариуме"}
+        {/* Compat banner(s) */}
+        <div style={{ margin: "12px 18px", display: "flex", flexDirection: "column", gap: 6 }}>
+          {pairWarnings.length === 0 ? (
+            <div style={{ background: "#071C14", border: "1px solid #00C9B1", borderRadius: 10, padding: "8px 12px", fontSize: 12, textAlign: "center", color: "#00C9B1", fontWeight: 600 }}>
+              ✅ Все выбранные рыбы отлично уживутся вместе
+            </div>
+          ) : pairWarnings.map((w, i) => (
+            <div key={i} style={{
+              background: w.c.level === "bad" ? "#2A1414" : "#1E1800",
+              border: `1px solid ${w.c.level === "bad" ? "#FF6B6B" : "#F0A93C"}`,
+              borderRadius: 10, padding: "8px 12px", fontSize: 11.5, textAlign: "center",
+              color: w.c.level === "bad" ? "#FF6B6B" : "#F0A93C", fontWeight: 600,
+            }}>
+              {w.c.level === "bad" ? "⚠️" : "🟡"} {w.a.name.split(" ")[0]} + {w.b.name.split(" ")[0]}: {w.c.reason}
+            </div>
+          ))}
         </div>
         {/* Table */}
-        <div style={{ padding: "0 18px 32px" }}>
+        <div style={{ padding: "0 18px 32px", overflowX: "auto" }}>
           {rows.map((r, i) => (
             <div key={i} style={{
-              display: "grid", gridTemplateColumns: "auto 1fr 1fr",
+              display: "grid", gridTemplateColumns: gridCols,
               gap: 0, borderBottom: "1px solid #1C3A4A",
-              padding: "10px 0",
+              padding: "10px 0", minWidth: 90 + list.length * 80,
             }}>
               <div style={{ fontSize: 11, color: "#6C8E96", width: 90, paddingRight: 8 }}>{r.label}</div>
-              <div style={{ fontSize: 12, fontWeight: 600, textAlign: "center", color: "#C9DEE2" }}>{r.a}</div>
-              <div style={{ fontSize: 12, fontWeight: 600, textAlign: "center", color: "#C9DEE2" }}>{r.b}</div>
+              {list.map(f => (
+                <div key={f.id} style={{ fontSize: 12, fontWeight: 600, textAlign: "center", color: "#C9DEE2" }}>{r.get(f)}</div>
+              ))}
             </div>
           ))}
         </div>
@@ -1662,7 +2185,7 @@ function ARPreview({ fish, onClose }) {
 }
 
 /* ---------- Fish card (grid) ---------- */
-function FishCard({ fish, compat, inCart, onOpen, onAdd, onCompare }) {
+function FishCard({ fish, compat, inCart, onOpen, onAdd, onCompare, inCompare, isFav, onToggleFav }) {
   const ringColor =
     compat.level === "bad" ? "#FF6B6B" : compat.level === "warn" ? "#F0A93C" : "#1C3A4A";
   const stock = useMemo(() => getStock(fish), [fish.id]);
@@ -1726,6 +2249,19 @@ function FishCard({ fish, compat, inCart, onOpen, onAdd, onCompare }) {
             ×{inCart}
           </div>
         )}
+        {onToggleFav && (
+          <button
+            onClick={(e) => { e.stopPropagation(); onToggleFav(fish); }}
+            title={isFav ? "Убрать из избранного" : "В избранное"}
+            style={{
+              position: "absolute", bottom: 8, right: 8,
+              background: "rgba(8,19,31,0.7)", border: "none",
+              borderRadius: "50%", width: 28, height: 28,
+              fontSize: 14, cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}
+          >{isFav ? "❤️" : "🤍"}</button>
+        )}
       </div>
       <div style={{ padding: "10px 12px 12px" }}>
         <div style={{ display: "flex", gap: 4, marginBottom: 6, flexWrap: "wrap" }}>
@@ -1743,6 +2279,19 @@ function FishCard({ fish, compat, inCart, onOpen, onAdd, onCompare }) {
               {b}
             </span>
           ))}
+          {fish.type === "food" && (
+            <span
+              style={{
+                fontSize: 10, fontWeight: 700,
+                background: "#0F2A26", color: "#00C9B1",
+                border: "1px solid #00C9B144",
+                borderRadius: 6,
+                padding: "2px 6px",
+              }}
+            >
+              🔁 Подписка −10%
+            </span>
+          )}
         </div>
         {lowStock && (
           <div style={{
@@ -1775,9 +2324,9 @@ function FishCard({ fish, compat, inCart, onOpen, onAdd, onCompare }) {
               <button
                 onClick={(e) => { e.stopPropagation(); onCompare(fish); }}
                 style={{
-                  background: "#102433", color: "#9FC4CC",
-                  border: "1px solid #1C3A4A", borderRadius: 10,
-                  padding: "6px 8px", fontSize: 12, cursor: "pointer",
+                  background: inCompare ? "#F0A93C" : "#102433", color: inCompare ? "#08131F" : "#9FC4CC",
+                  border: `1px solid ${inCompare ? "#F0A93C" : "#1C3A4A"}`, borderRadius: 10,
+                  padding: "6px 8px", fontSize: 12, cursor: "pointer", fontWeight: inCompare ? 800 : 400,
                 }}
                 title="Сравнить"
               >⚖️</button>
@@ -1808,9 +2357,10 @@ function FishCard({ fish, compat, inCart, onOpen, onAdd, onCompare }) {
 }
 
 /* ---------- Fish detail sheet ---------- */
-function FishDetail({ fish, compat, onClose, onAdd, onCompare }) {
+function FishDetail({ fish, compat, onClose, onAdd, onCompare, inCompare, isFav, onToggleFav, onSubscribe, activeSubscription }) {
   const [tab, setTab] = useState("about");
   const [arOpen, setArOpen] = useState(false);
+  const [subInterval, setSubInterval] = useState((activeSubscription && activeSubscription.intervalWeeks) || 4);
   if (!fish) return null;
   const stock = getStock(fish);
   const lowStock = stock <= 4;
@@ -1851,6 +2401,27 @@ function FishDetail({ fish, compat, onClose, onAdd, onCompare }) {
           }}
         >
           {fish.img}
+          {onToggleFav && (
+            <button
+              onClick={() => onToggleFav(fish)}
+              style={{
+                position: "absolute",
+                top: 12,
+                right: 56,
+                background: "rgba(0,0,0,0.4)",
+                border: "none",
+                color: "#E8F4F8",
+                borderRadius: 999,
+                width: 32,
+                height: 32,
+                fontSize: 16,
+                cursor: "pointer",
+                display: "flex", alignItems: "center", justifyContent: "center",
+              }}
+            >
+              {isFav ? "❤️" : "🤍"}
+            </button>
+          )}
           <button
             onClick={onClose}
             style={{
@@ -2021,12 +2592,79 @@ function FishDetail({ fish, compat, onClose, onAdd, onCompare }) {
                 <button
                   onClick={() => onCompare(fish)}
                   style={{
-                    background: "#102433", color: "#9FC4CC",
-                    border: "1px solid #1C3A4A", borderRadius: 12,
+                    background: inCompare ? "#F0A93C" : "#102433", color: inCompare ? "#08131F" : "#9FC4CC",
+                    border: `1px solid ${inCompare ? "#F0A93C" : "#1C3A4A"}`, borderRadius: 12,
                     padding: "10px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer",
                   }}
-                >⚖️ Сравнить</button>
+                >⚖️ {inCompare ? "В сравнении" : "Сравнить"}</button>
               )}
+            </div>
+          )}
+          {fish.type === "food" && onSubscribe && (
+            <div
+              style={{
+                background: "#0F2A26",
+                border: "1px solid #00C9B1",
+                borderRadius: 12,
+                padding: "12px 14px",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                <span style={{ fontSize: 13, fontWeight: 700, color: "#00C9B1" }}>
+                  🔁 Подписка на корм
+                </span>
+                <span style={{
+                  fontSize: 11, fontWeight: 700, color: "#08131F",
+                  background: "#F0A93C", borderRadius: 6, padding: "2px 7px",
+                }}>
+                  −10%
+                </span>
+              </div>
+              <div style={{ fontSize: 12.5, color: "#9FC4CC", marginBottom: 10, lineHeight: 1.5 }}>
+                Автоматическая доставка без напоминаний — отменить можно в любой момент в профиле.
+              </div>
+              <div style={{ display: "flex", gap: 6, marginBottom: activeSubscription ? 10 : 0 }}>
+                {SUBSCRIPTION_INTERVALS.map((opt) => (
+                  <button
+                    key={opt.weeks}
+                    onClick={() => setSubInterval(opt.weeks)}
+                    style={{
+                      flex: 1,
+                      background: subInterval === opt.weeks ? "#00C9B1" : "#102433",
+                      color: subInterval === opt.weeks ? "#08131F" : "#9FC4CC",
+                      border: `1px solid ${subInterval === opt.weeks ? "#00C9B1" : "#1C3A4A"}`,
+                      borderRadius: 9,
+                      padding: "8px 4px",
+                      fontSize: 11.5,
+                      fontWeight: 700,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              {activeSubscription && (
+                <div style={{ fontSize: 11.5, color: "#6C8E96", marginBottom: 10 }}>
+                  Следующая доставка: {fmtDate(activeSubscription.nextDate)}
+                </div>
+              )}
+              <button
+                onClick={() => onSubscribe(fish, subInterval)}
+                style={{
+                  width: "100%",
+                  background: "none",
+                  border: "1px solid #00C9B1",
+                  borderRadius: 10,
+                  padding: "9px",
+                  color: "#00C9B1",
+                  fontSize: 13,
+                  fontWeight: 700,
+                  cursor: "pointer",
+                }}
+              >
+                {activeSubscription ? "Обновить подписку" : `Оформить за ${formatSum(Math.round(fish.price * (1 - SUBSCRIPTION_DISCOUNT)))}`}
+              </button>
             </div>
           )}
           <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
@@ -2195,7 +2833,7 @@ function CartDrawer({ open, onClose, cart, onRemove, region, onCheckout }) {
 /* ============================================================
    UX: «Пока везут» — инструкция по подготовке аквариума
    ============================================================ */
-function PostOrderScreen({ cart, onClose }) {
+function PostOrderScreen({ cart, onClose, onCreateDiary }) {
   const fishItems = cart.filter(f => f.type === "fish");
   const maxTemp = fishItems.length > 0 ? Math.max(...fishItems.map(f => f.temp[1])) : 26;
   const minTemp = fishItems.length > 0 ? Math.min(...fishItems.map(f => f.temp[0])) : 22;
@@ -2320,12 +2958,24 @@ function PostOrderScreen({ cart, onClose }) {
           <div style={{ fontSize: 12, color: "#6C8E96" }}>Гарантия 48 часов. Если что-то пошло не так — напишите нам</div>
         </div>
 
+        {onCreateDiary && fishItems.length > 0 && (
+          <button
+            onClick={() => onCreateDiary(fishItems)}
+            style={{
+              width: "100%", marginTop: 16,
+              background: "linear-gradient(135deg, #00C9B1, #00A693)", color: "#08131F",
+              border: "none", borderRadius: 14, padding: "14px",
+              fontSize: 14.5, fontWeight: 800, cursor: "pointer",
+            }}
+          >📔 Создать дневник для этого аквариума</button>
+        )}
+
         <button
           onClick={onClose}
           style={{
-            width: "100%", marginTop: 16,
-            background: "#00C9B1", color: "#08131F",
-            border: "none", borderRadius: 14, padding: "14px",
+            width: "100%", marginTop: 10,
+            background: "#102433", color: "#9FC4CC",
+            border: "1px solid #1C3A4A", borderRadius: 14, padding: "14px",
             fontSize: 15, fontWeight: 700, cursor: "pointer",
           }}
         >← Вернуться в каталог</button>
@@ -2337,18 +2987,41 @@ function PostOrderScreen({ cart, onClose }) {
 /* ============================================================
    UX: AI Чат-поддержка — плавающая кнопка + чат
    ============================================================ */
-function AIChatWidget({ cart }) {
-  const [open, setOpen] = useState(false);
+function AIChatWidget({ cart, open: openProp, onOpenChange, autoEscalate }) {
+  const [openState, setOpenState] = useState(false);
+  const open = openProp !== undefined ? openProp : openState;
+  const setOpen = (v) => { onOpenChange ? onOpenChange(v) : setOpenState(v); };
   const [messages, setMessages] = useState([
-    { role: "bot", text: "Привет! 🐠 Я Марджон — ваш помощник по рыбам! Спрашивайте про рыб, уход, совместимость или доставку." }
+    { role: "bot", text: "Привет! 🐠 Я Marjon, как могу помочь? Спрашивайте про рыб, уход, совместимость или доставку." }
   ]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
+  const [humanMode, setHumanMode] = useState(false);
+  const [connecting, setConnecting] = useState(false);
   const bottomRef = useRef(null);
+  const escalated = useRef(false);
 
   useEffect(() => {
     if (open) bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, open]);
+
+  useEffect(() => {
+    if (autoEscalate && open && !escalated.current) {
+      escalated.current = true;
+      escalateToHuman();
+    }
+  }, [autoEscalate, open]);
+
+  function escalateToHuman() {
+    if (humanMode || connecting) return;
+    setConnecting(true);
+    setMessages(m => [...m, { role: "system", text: "Запрос передан живому специалисту…" }]);
+    setTimeout(() => {
+      setConnecting(false);
+      setHumanMode(true);
+      setMessages(m => [...m, { role: "human", text: "Привет! Это Анна, специалист AquaMarjon 👋 Я на связи и помогу разобраться. Опишите ситуацию подробнее." }]);
+    }, 1400);
+  }
 
   async function sendMessage() {
     if (!input.trim() || loading) return;
@@ -2358,6 +3031,8 @@ function AIChatWidget({ cart }) {
     setLoading(true);
 
     const cartSummary = cart.filter(f => f.type === "fish").map(f => f.name).join(", ") || "пока пусто";
+    const humanSystem = `Ты — Анна, живой специалист интернет-магазина аквариумных рыб AquaMarjon (Узбекистан), который только что подключился к чату с клиентом вместо AI-бота. Отвечай как человек: тепло, конкретно, можешь задавать уточняющие вопросы, иногда используй разговорные обороты на русском. Не упоминай, что ты AI. В корзине покупателя: ${cartSummary}.`;
+    const botSystem = `Ты — Marjon, помощник интернет-магазина аквариумных рыб AquaMarjon (Узбекистан). Не упоминай, что ты AI или бот, представляйся просто как Marjon. Отвечай коротко, дружелюбно, на русском языке. Используй эмодзи умеренно. В корзине покупателя сейчас: ${cartSummary}. Помогай с выбором рыб, уходом, совместимостью, вопросами о доставке. Если вопрос сложный (болезнь рыбы, спорный заказ, жалоба) — предложи позвать живого консультанта.`;
     try {
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
@@ -2365,15 +3040,15 @@ function AIChatWidget({ cart }) {
         body: JSON.stringify({
           model: "claude-sonnet-4-6",
           max_tokens: 1000,
-          system: `Ты — Марджон, дружелюбный помощник интернет-магазина аквариумных рыб AquaMarjon (Узбекистан). Отвечай коротко, тепло и по-человечески, на русском языке. Используй эмодзи умеренно. В корзине покупателя сейчас: ${cartSummary}. Помогай с выбором рыб, уходом, совместимостью, вопросами о доставке. Представляйся как Марджон.`,
+          system: humanMode ? humanSystem : botSystem,
           messages: [{ role: "user", content: userMsg }],
         }),
       });
       const data = await res.json();
       const reply = data.content?.[0]?.text || "Упс, что-то пошло не так. Попробуйте ещё раз.";
-      setMessages(m => [...m, { role: "bot", text: reply }]);
+      setMessages(m => [...m, { role: humanMode ? "human" : "bot", text: reply }]);
     } catch {
-      setMessages(m => [...m, { role: "bot", text: "Нет соединения. Попробуйте позже." }]);
+      setMessages(m => [...m, { role: humanMode ? "human" : "bot", text: "Нет соединения. Попробуйте позже." }]);
     }
     setLoading(false);
   }
@@ -2412,13 +3087,23 @@ function AIChatWidget({ cart }) {
           }}>
             <div style={{
               width: 32, height: 32, borderRadius: "50%",
-              background: "#00C9B122", border: "1px solid #00C9B144",
+              background: humanMode ? "#F0A93C22" : "#00C9B122", border: `1px solid ${humanMode ? "#F0A93C44" : "#00C9B144"}`,
               display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16,
-            }}>🐠</div>
+            }}>{humanMode ? "👩" : "🐠"}</div>
             <div style={{ flex: 1 }}>
-              <div style={{ fontSize: 13, fontWeight: 700 }}>Марджон — ваш помощник</div>
-              <div style={{ fontSize: 11, color: "#00C9B1" }}>● Онлайн</div>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>{humanMode ? "Анна · специалист AquaMarjon" : "Marjon · помощник AquaMarjon"}</div>
+              <div style={{ fontSize: 11, color: connecting ? "#F0A93C" : "#00C9B1" }}>
+                {connecting ? "● Подключаем специалиста…" : "● Онлайн"}
+              </div>
             </div>
+            {!humanMode && (
+              <button
+                onClick={escalateToHuman}
+                disabled={connecting}
+                title="Позвать живого консультанта"
+                style={{ background: "none", border: "1px solid #1C3A4A", borderRadius: 8, padding: "5px 9px", color: "#9FC4CC", fontSize: 11, cursor: connecting ? "default" : "pointer", whiteSpace: "nowrap" }}
+              >👤 Консультант</button>
+            )}
             <button onClick={() => setOpen(false)} style={{ background: "none", border: "none", color: "#6C8E96", fontSize: 18, cursor: "pointer" }}>✕</button>
           </div>
 
@@ -2436,20 +3121,35 @@ function AIChatWidget({ cart }) {
                 ))}
               </div>
             )}
-            {messages.map((m, i) => (
-              <div key={i} style={{
-                display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start",
-              }}>
-                <div style={{
-                  maxWidth: "80%",
-                  background: m.role === "user" ? "#00C9B1" : "#102433",
-                  color: m.role === "user" ? "#08131F" : "#E8F4F8",
-                  borderRadius: m.role === "user" ? "14px 14px 4px 14px" : "14px 14px 14px 4px",
-                  padding: "9px 12px",
-                  fontSize: 13, lineHeight: 1.55,
-                }}>{m.text}</div>
+            {messages.map((m, i) => {
+              if (m.role === "system") {
+                return (
+                  <div key={i} style={{ textAlign: "center", fontSize: 11, color: "#6C8E96", padding: "2px 0" }}>
+                    {m.text}
+                  </div>
+                );
+              }
+              return (
+                <div key={i} style={{
+                  display: "flex", justifyContent: m.role === "user" ? "flex-end" : "flex-start",
+                }}>
+                  <div style={{
+                    maxWidth: "80%",
+                    background: m.role === "user" ? "#00C9B1" : m.role === "human" ? "#2A1F0A" : "#102433",
+                    color: m.role === "user" ? "#08131F" : "#E8F4F8",
+                    border: m.role === "human" ? "1px solid #F0A93C44" : "none",
+                    borderRadius: m.role === "user" ? "14px 14px 4px 14px" : "14px 14px 14px 4px",
+                    padding: "9px 12px",
+                    fontSize: 13, lineHeight: 1.55,
+                  }}>{m.text}</div>
+                </div>
+              );
+            })}
+            {connecting && (
+              <div style={{ display: "flex", justifyContent: "center" }}>
+                <div style={{ fontSize: 11, color: "#F0A93C" }}>🔄 Ищем свободного специалиста…</div>
               </div>
-            ))}
+            )}
             {loading && (
               <div style={{ display: "flex" }}>
                 <div style={{
@@ -2507,11 +3207,35 @@ function AIChatWidget({ cart }) {
 }
 
 /* ---------- Catalog screen ---------- */
-function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, onOpenProfile, onOpenDoctor, onOrderPlaced, hideHeader, externalCartOpen, onExternalCartClose, quizFilter, onClearQuizFilter }) {
-  const [search, setSearch] = useState("");
+function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, onOpenProfile, onOpenDoctor, onOpenHome, onOrderPlaced, hideHeader, hideBottomNav, externalCartOpen, onExternalCartClose, quizFilter, onClearQuizFilter, wishlist, onToggleWishlist, subscriptions, onSubscribe, initialSearch, onClearInitialSearch, initialCategory, onClearInitialCategory, filterSeed, onOpenDiary, initialToast, onClearInitialToast }) {
+  const [search, setSearch] = useState(initialSearch || "");
+  useEffect(() => {
+    if (initialSearch) {
+      setSearch(initialSearch);
+      onClearInitialSearch && onClearInitialSearch();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialSearch]);
   const [searchFocused, setSearchFocused] = useState(false);
   const [productType, setProductType] = useState("fish");
   const [cat, setCat] = useState("all");
+  useEffect(() => {
+    if (initialCategory) {
+      setCat(initialCategory);
+      onClearInitialCategory && onClearInitialCategory();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialCategory]);
+  // Сид фильтра для встроенного каталога на главной — пересчитывается на каждый клик
+  // по категории (даже повторный), поэтому передаём готовый объект с токеном.
+  useEffect(() => {
+    if (filterSeed) {
+      setSearch(filterSeed.search || "");
+      setCat(filterSeed.cat || "all");
+      setProductType("fish");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterSeed]);
   const [sort, setSort] = useState("popular"); // popular | price_asc | price_desc | rating | new
   const [tankVolume, setTankVolume] = useState(0); // 0 = не фильтровать
   const [priceMax, setPriceMax] = useState(0); // 0 = не фильтровать
@@ -2522,8 +3246,8 @@ function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, on
   const [postOrderCart, setPostOrderCart] = useState(null); // для экрана «Пока везут»
   const [chatOpen, setChatOpen] = useState(false);
   const [toast, setToast] = useState(null);
-  const [compareFish, setCompareFish] = useState(null);
-  const [compareTarget, setCompareTarget] = useState(null);
+  const [compareList, setCompareList] = useState([]); // до 4 рыб для сравнения
+  const [compareOpen, setCompareOpen] = useState(false);
   const toastTimer = useRef(null);
 
   useEffect(() => {
@@ -2562,10 +3286,6 @@ function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, on
       if (cat === "all") return true;
       if (cat === "peaceful") return f.temper === "peaceful";
       if (cat === "aggressive") return f.temper === "aggressive";
-      if (cat === "swordtail") return f.id === "swordtail" || f.name.toLowerCase().includes("меченос");
-      if (cat === "neon") return f.id === "neon" || f.name.toLowerCase().includes("неон");
-      if (cat === "molly") return f.id === "molly" || f.name.toLowerCase().includes("молл") || f.name.toLowerCase().includes("молине");
-      if (cat === "cupid") return f.id === "cupid" || f.name.toLowerCase().includes("купид");
       if (cat === "kids") return f.goal && f.goal.includes("kids");
       if (cat === "local") return f.origin === "local";
       if (cat === "import") return f.origin === "import";
@@ -2588,15 +3308,18 @@ function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, on
     toastTimer.current = setTimeout(() => setToast(null), 2200);
   }
 
-  const [predatorDialog, setPredatorDialog] = useState<{fish: any} | null>(null);
+  // Тост, переданный извне (например, после «Повторить заказ» из профиля) —
+  // показываем один раз при монтировании и сразу сообщаем родителю, что забрали.
+  useEffect(() => {
+    if (initialToast) {
+      showToast(initialToast.text, initialToast.type || "ok");
+      onClearInitialToast && onClearInitialToast();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialToast]);
 
   function addToCart(fish) {
     const compat = checkCompatibility(fish, cart);
-    // Если добавляем хищника к мирным рыбам — спрашиваем
-    if (fish.temper === "aggressive" && cart.some(c => c.type === "fish" && c.temper === "peaceful")) {
-      setPredatorDialog({ fish });
-      return;
-    }
     if (compat.level === "bad") {
       showToast(`⚠️ ${fish.name.split(" ")[0]} несовместим с тем что в корзине`, "bad");
       return;
@@ -2607,6 +3330,14 @@ function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, on
 
   function removeFromCart(idx) {
     setCart((c) => c.filter((_, i) => i !== idx));
+  }
+
+  function toggleCompare(fish) {
+    setCompareList((list) => {
+      if (list.some((f) => f.id === fish.id)) return list.filter((f) => f.id !== fish.id);
+      if (list.length >= 4) { showToast("⚖️ Можно сравнить максимум 4 рыбы", "bad"); return list; }
+      return [...list, fish];
+    });
   }
 
   const countById = useMemo(() => {
@@ -2927,8 +3658,8 @@ function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, on
         </div>
       )}
 
-      {/* Баннер режима сравнения */}
-      {compareFish && (
+      {/* Трей режима сравнения */}
+      {compareList.length > 0 && (
         <div style={{
           margin: "0 16px 4px",
           background: "linear-gradient(90deg, #1A0E28, #102433)",
@@ -2936,14 +3667,21 @@ function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, on
           borderRadius: 14, padding: "10px 14px",
           display: "flex", alignItems: "center", gap: 10,
         }}>
-          <span style={{ fontSize: 20 }}>{compareFish.img}</span>
+          <div style={{ display: "flex", gap: -4 }}>
+            {compareList.map((f) => (
+              <span key={f.id} style={{ fontSize: 18, marginRight: -4 }}>{f.img}</span>
+            ))}
+          </div>
           <div style={{ flex: 1 }}>
-            <div style={{ fontSize: 12, fontWeight: 700, color: "#F0A93C" }}>⚖️ Режим сравнения</div>
+            <div style={{ fontSize: 12, fontWeight: 700, color: "#F0A93C" }}>⚖️ Сравнение ({compareList.length}/4)</div>
             <div style={{ fontSize: 11, color: "#9FC4CC", marginTop: 1 }}>
-              Выберите вторую рыбу для сравнения с «{compareFish.name.split(" ")[0]}»
+              {compareList.length < 2 ? "Выберите ещё одну рыбу" : "Готово к сравнению"}
             </div>
           </div>
-          <button onClick={() => setCompareFish(null)} style={{ background: "none", border: "1px solid #1C3A4A", borderRadius: 8, padding: "4px 10px", color: "#6C8E96", fontSize: 11, cursor: "pointer" }}>✕</button>
+          {compareList.length >= 2 && (
+            <button onClick={() => setCompareOpen(true)} style={{ background: "#F0A93C", border: "none", borderRadius: 8, padding: "6px 12px", color: "#08131F", fontSize: 12, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>Сравнить</button>
+          )}
+          <button onClick={() => setCompareList([])} style={{ background: "none", border: "1px solid #1C3A4A", borderRadius: 8, padding: "4px 10px", color: "#6C8E96", fontSize: 11, cursor: "pointer" }}>✕</button>
         </div>
       )}
 
@@ -2955,24 +3693,12 @@ function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, on
             fish={f}
             compat={checkCompatibility(f, cart)}
             inCart={countById[f.id] || 0}
-            onOpen={(fish) => {
-              if (compareFish && fish.type === "fish" && fish.id !== compareFish.id) {
-                setCompareTarget({ a: compareFish, b: fish });
-                setCompareFish(null);
-              } else {
-                setOpenFish(fish);
-              }
-            }}
+            onOpen={(fish) => setOpenFish(fish)}
             onAdd={addToCart}
-            onCompare={(fish) => {
-              if (!compareFish) {
-                setCompareFish(fish);
-                showToast(`⚖️ Теперь выберите вторую рыбу для сравнения`, "ok");
-              } else if (fish.id !== compareFish.id) {
-                setCompareTarget({ a: compareFish, b: fish });
-                setCompareFish(null);
-              }
-            }}
+            onCompare={toggleCompare}
+            inCompare={compareList.some((c) => c.id === f.id)}
+            isFav={wishlist ? wishlist.some((w) => w.id === f.id) : false}
+            onToggleFav={onToggleWishlist}
           />
         ))}
         {filtered.length === 0 && (
@@ -2983,6 +3709,7 @@ function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, on
       </div>
 
       {/* bottom nav */}
+      {!hideBottomNav && (
       <div
         style={{
           position: "fixed",
@@ -2998,11 +3725,10 @@ function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, on
         }}
       >
         {[
-          ["🏠", "Главная", null],
+          ["🏠", "Главная", onOpenHome],
           ["🐠", "Каталог", null],
           ["🩺", "Доктор", onOpenDoctor],
           ["🤖", "AI Подбор", onOpenConfigurator],
-          ["👤", "Я", onOpenProfile],
         ].map(([icon, label, action], i) => (
           <button
             key={label}
@@ -3021,6 +3747,7 @@ function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, on
           </button>
         ))}
       </div>
+      )}
 
       <FishDetail
         fish={openFish}
@@ -3030,22 +3757,21 @@ function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, on
           addToCart(f);
           setOpenFish(null);
         }}
-        onCompare={(fish) => {
-          setOpenFish(null);
-          if (compareFish && fish.id !== compareFish.id) {
-            setCompareTarget({ a: compareFish, b: fish });
-            setCompareFish(null);
-          } else {
-            setCompareFish(fish);
-            showToast(`⚖️ Теперь выберите вторую рыбу для сравнения`, "ok");
-          }
-        }}
+        onCompare={toggleCompare}
+        inCompare={openFish ? compareList.some((c) => c.id === openFish.id) : false}
+        isFav={openFish && wishlist ? wishlist.some((w) => w.id === openFish.id) : false}
+        onToggleFav={onToggleWishlist}
+        onSubscribe={onSubscribe ? (f, weeks) => {
+          onSubscribe(f, weeks);
+          showToast(`🔁 Подписка на «${f.name.split(" ")[0]}» оформлена`, "ok");
+        } : undefined}
+        activeSubscription={openFish && subscriptions ? subscriptions.find((s) => s.productId === openFish.id) : null}
       />
-      {compareTarget && (
+      {compareOpen && (
         <CompareModal
-          fishA={compareTarget.a}
-          fishB={compareTarget.b}
-          onClose={() => setCompareTarget(null)}
+          fishes={compareList}
+          onClose={() => setCompareOpen(false)}
+          onRemove={(id) => setCompareList((l) => l.filter((f) => f.id !== id))}
         />
       )}
       <CartDrawer
@@ -3078,64 +3804,17 @@ function Catalog({ region, cart, setCart, onChangeRegion, onOpenConfigurator, on
         <PostOrderScreen
           cart={postOrderCart}
           onClose={() => setPostOrderCart(null)}
+          onCreateDiary={onOpenDiary ? (fishItems) => {
+            // Передаём дневнику черновик аквариума с автозаполнением рыб из
+            // корзины через localStorage — DiaryScreen подхватит его при монтировании.
+            writeLocal(PENDING_DIARY_TANK_KEY, buildTankDraftFromCart(fishItems));
+            setPostOrderCart(null);
+            onOpenDiary();
+          } : undefined}
         />
       )}
       <AIChatWidget cart={cart} />
       <Toast toast={toast} />
-
-      {/* Диалог хищника */}
-      {predatorDialog && (
-        <div style={{
-          position: "fixed", inset: 0, background: "rgba(5,10,16,0.88)",
-          zIndex: 300, display: "flex", alignItems: "center", justifyContent: "center",
-          padding: "0 20px",
-        }} onClick={() => setPredatorDialog(null)}>
-          <div onClick={e => e.stopPropagation()} style={{
-            background: "#0B1B28", border: "1px solid #F0A93C55",
-            borderRadius: 20, padding: "24px 20px",
-            color: "#E8F4F8", maxWidth: 360, width: "100%",
-          }}>
-            <div style={{ fontSize: 40, textAlign: "center", marginBottom: 12 }}>⚔️</div>
-            <div style={{ fontSize: 17, fontWeight: 800, textAlign: "center", marginBottom: 8 }}>
-              {predatorDialog.fish.name.split(" ")[0]} — хищник
-            </div>
-            <div style={{
-              fontSize: 13.5, color: "#C9DEE2", lineHeight: 1.65,
-              textAlign: "center", marginBottom: 20,
-            }}>
-              Эту рыбу лучше держать в <strong style={{ color: "#F0A93C" }}>отдельном аквариуме</strong> — она может обидеть мирных рыб, которые уже в вашей корзине.
-              <br /><br />
-              Вы добавляете её для другого аквариума?
-            </div>
-            <div style={{ display: "flex", gap: 10 }}>
-              <button
-                onClick={() => {
-                  setCart(c => [...c, predatorDialog.fish]);
-                  showToast(`✅ ${predatorDialog.fish.name.split(" ")[0]} добавлен в корзину`, "ok");
-                  setPredatorDialog(null);
-                }}
-                style={{
-                  flex: 1, background: "#F0A93C", color: "#08131F",
-                  border: "none", borderRadius: 12, padding: "13px",
-                  fontSize: 14, fontWeight: 700, cursor: "pointer",
-                }}
-              >
-                Да, другой аквариум
-              </button>
-              <button
-                onClick={() => setPredatorDialog(null)}
-                style={{
-                  flex: 1, background: "#102433", color: "#9FC4CC",
-                  border: "1px solid #1C3A4A", borderRadius: 12, padding: "13px",
-                  fontSize: 14, fontWeight: 600, cursor: "pointer",
-                }}
-              >
-                Не добавлять
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -3156,6 +3835,9 @@ const PAY_METHODS = [
   { id: "click", label: "Click",             sub: "Быстрая оплата по QR-коду", icon: "🟦" },
   { id: "payme", label: "Payme",             sub: "Карта Uzcard или Humo",     icon: "🟢" },
 ];
+// ⚠️ Используется как офлайн-фолбэк в legacyPromoFallback() (см. начало файла),
+// если бэкенд /api/promos/validate недоступен. НЕ мёртвый код — не удалять
+// без необходимости. Удалить можно после того как бэкенд гарантированно стабилен.
 const CHECKOUT_PROMOS = { "AQUA10": 10, "FISH20": 20, "NEWFISH": 15 };
 const SAVED_ADDRESSES = [
   "ул. Навои 12, кв. 34, Ташкент",
@@ -3918,44 +4600,23 @@ function StepAddress({ region, onChangeRegion, address, setAddress, comment, set
 }
 
 /* ── STEP 2: оплата ───────────────────────────────────────── */
-function StepPayment({ pay, setPay, promo, setPromo, promoDiscount, setPromoDiscount,
-  groupedCart, onAddUpsell, onBack, onNext, subtotal, discount, delivery, total, deliveryInfo, region }) {
-  const [promoInput, setPromoInput] = useState(promo);
-  const [promoErr, setPromoErr] = useState("");
-
-  function applyPromo() {
-    const key = promoInput.trim().toUpperCase();
-    if (CHECKOUT_PROMOS[key]) {
-      setPromo(key); setPromoDiscount(CHECKOUT_PROMOS[key]); setPromoErr("");
-    } else {
-      setPromoDiscount(0); setPromoErr("Промокод не найден");
-    }
-  }
+function StepPayment({ pay, setPay, promo, setPromo, promoResult, setPromoResult,
+  groupedCart, onAddUpsell, onBack, onNext, subtotal, discount, delivery, total, deliveryInfo, region, userId }) {
 
   return (
     <div>
       <UpsellBlock groupedCart={groupedCart} onAddUpsell={onAddUpsell} />
 
       {/* Промокод */}
-      <CkField label="Промокод">
-        <div style={{ display: "flex", gap: 8 }}>
-          <input value={promoInput} onChange={(e) => { setPromoInput(e.target.value); setPromoErr(""); }}
-            placeholder="Напр.: AQUA10"
-            style={{ flex: 1, background: "#102433",
-              border: `1px solid ${promoErr ? "#FF6B6B" : promoDiscount > 0 ? "#4ADE80" : "#1C3A4A"}`,
-              borderRadius: 12, padding: "11px 14px", color: "#E8F4F8", fontSize: 14,
-              outline: "none", textTransform: "uppercase" }} />
-          <button onClick={applyPromo}
-            style={{ flexShrink: 0, background: "#0F2A26", border: "1px solid #00C9B1",
-              borderRadius: 12, padding: "11px 16px", color: "#00C9B1",
-              fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
-            Применить
-          </button>
-        </div>
-        {promoErr && <div style={{ fontSize: 11, color: "#FF6B6B", marginTop: 5 }}>{promoErr}</div>}
-        {promoDiscount > 0 && <div style={{ fontSize: 12, color: "#4ADE80", marginTop: 5 }}>✓ Скидка {promoDiscount}% применена!</div>}
-        <div style={{ fontSize: 11, color: "#6C8E96", marginTop: 6 }}>Доступные коды: AQUA10 · FISH20 · NEWFISH</div>
-      </CkField>
+      <PromoField
+        subtotal={subtotal}
+        userId={userId}
+        promoResult={promoResult}
+        onApply={(r) => {
+          setPromoResult(r);
+          setPromo(r?.code ?? "");
+        }}
+      />
 
       {/* Способы оплаты */}
       <CkField label="Способ оплаты">
@@ -3989,7 +4650,12 @@ function StepPayment({ pay, setPay, promo, setPromo, promoDiscount, setPromoDisc
         </div>
         {discount > 0 && (
           <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "#4ADE80", marginBottom: 6 }}>
-            <span>Скидка {promoDiscount}%</span><span>−{formatSum(discount)}</span>
+            <span>Скидка ({promoResult?.label})</span><span>−{formatSum(discount)}</span>
+          </div>
+        )}
+        {promoResult?.type === "free_delivery" && (
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "#4ADE80", marginBottom: 6 }}>
+            <span>🚚 Бесплатная доставка</span><span>−{formatSum(deliveryInfo.price)}</span>
           </div>
         )}
         <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, color: "#6C8E96", marginBottom: 2 }}>
@@ -4108,16 +4774,16 @@ function Checkout({ region, cart, setCart, onClose, onDone, onChangeRegion }) {
   const [slot, setSlot] = useState("day");
   const [phone, setPhone] = useState("");
   const [pay, setPay] = useState("cash");
-  const [promo, setPromo] = useState("");
-  const [promoDiscount, setPromoDiscount] = useState(0);
+  const [promo, setPromo] = useState("");                              // код для отправки в /orders
+  const [promoResult, setPromoResult] = useState<PromoResult | null>(null);
 
   const orderId = useMemo(() => Math.floor(1000 + Math.random() * 9000), []);
   const deliveryInfo = DELIVERY_RATES[region] || { price: 35000, time: "сегодня", courier: "Курьер", phone: "", rating: 4.8, trips: 0 };
 
   const groupedCart = useMemo(() => groupCart(cart), [cart]);
   const subtotal = cart.reduce((s, f) => s + f.price, 0);
-  const delivery = cart.length === 0 ? 0 : deliveryInfo.price;
-  const discount = Math.round(subtotal * promoDiscount / 100);
+  const baseDelivery = cart.length === 0 ? 0 : deliveryInfo.price;
+  const { discount, delivery } = calcPromoSavings(promoResult, subtotal, baseDelivery);
   const total = subtotal - discount + delivery;
 
   function handleQtyChange(id, delta) {
@@ -4145,6 +4811,13 @@ function Checkout({ region, cart, setCart, onClose, onDone, onChangeRegion }) {
     setLoading(true);
   }
   async function handleDone() {
+    // Если применённый промокод — личная награда за бейдж дневника, гасим его
+    // здесь же, при подтверждённом оформлении заказа: это единственная точка,
+    // где мы точно знаем, что заказ состоялся, поэтому одноразовость надёжна
+    // и для офлайн-фолбэка (когда бэкенд недоступен), и для онлайн-пути.
+    if (promoResult && promoResult.label.includes("награда за достижение")) {
+      markRewardPromoUsed(promoResult.code);
+    }
     try {
       const items = groupedCart.map(([item, qty]: [any, number]) => ({
         product_id: item.id,
@@ -4164,6 +4837,7 @@ function Checkout({ region, cart, setCart, onClose, onDone, onChangeRegion }) {
           delivery_slot: slotObj ? `${slotObj.label} · ${slotObj.sub}` : slot,
           pay_method: pay,
           promo_code: promo || undefined,
+          promo_type: promoResult?.type || undefined,
           items,
           buyer_name: tgUser?.first_name,
           telegram_user: tgUser,
@@ -4266,12 +4940,13 @@ function Checkout({ region, cart, setCart, onClose, onDone, onChangeRegion }) {
             <StepPayment
               pay={pay} setPay={setPay}
               promo={promo} setPromo={setPromo}
-              promoDiscount={promoDiscount} setPromoDiscount={setPromoDiscount}
+              promoResult={promoResult} setPromoResult={setPromoResult}
               groupedCart={groupedCart} onAddUpsell={handleAddUpsell}
               onBack={() => setStep(1)} onNext={goToConfirm}
               subtotal={subtotal} discount={discount}
               delivery={delivery} total={total}
-              deliveryInfo={deliveryInfo} region={region} />
+              deliveryInfo={deliveryInfo} region={region}
+              userId={tgUser?.id} />
           )}
 
           {!loading && step === 3 && (
@@ -4788,6 +5463,17 @@ function AiConfigurator({ onClose, onApply }) {
   const [budget, setBudget] = useState(500000);
   const [plan, setPlan] = useState(null);
   const [generating, setGenerating] = useState(false);
+  const [calcMode, setCalcMode] = useState(false); // переключатель: ползунок vs калькулятор по размерам
+  const [dimL, setDimL] = useState(60);
+  const [dimW, setDimW] = useState(30);
+  const [dimH, setDimH] = useState(35);
+  const calcVolume = Math.round((dimL * dimW * dimH) / 1000); // см³ → литры
+
+  function applyCalcVolume() {
+    const v = Math.max(20, Math.min(350, calcVolume || 20));
+    setVolume(v);
+    setCalcMode(false);
+  }
 
   function goNext() {
     if (step === 3) {
@@ -4831,24 +5517,76 @@ function AiConfigurator({ onClose, onApply }) {
         {step === 1 && (
           <>
             <h2 style={{ fontSize: 20, fontWeight: 800, margin: "0 0 4px" }}>Какой у вас объём?</h2>
-            <p style={{ fontSize: 13, color: "#6C8E96", marginBottom: 24 }}>
+            <p style={{ fontSize: 13, color: "#6C8E96", marginBottom: 16 }}>
               Или сколько литров планируете — точность не важна
             </p>
-            <div style={{ textAlign: "center", fontSize: 40, fontWeight: 800, color: "#00C9B1", marginBottom: 6 }}>
-              {volume} л
+
+            <div style={{ display: "flex", gap: 6, marginBottom: 18, background: "#102433", border: "1px solid #1C3A4A", borderRadius: 12, padding: 4 }}>
+              <button
+                onClick={() => setCalcMode(false)}
+                style={{ flex: 1, background: !calcMode ? "#00C9B1" : "transparent", color: !calcMode ? "#08131F" : "#9FC4CC", border: "none", borderRadius: 9, padding: "8px 6px", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}
+              >🎚 Знаю литраж</button>
+              <button
+                onClick={() => setCalcMode(true)}
+                style={{ flex: 1, background: calcMode ? "#00C9B1" : "transparent", color: calcMode ? "#08131F" : "#9FC4CC", border: "none", borderRadius: 9, padding: "8px 6px", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}
+              >📐 Посчитать по размерам</button>
             </div>
-            <input
-              type="range"
-              min={20}
-              max={350}
-              step={10}
-              value={volume}
-              onChange={(e) => setVolume(Number(e.target.value))}
-              style={{ width: "100%", marginBottom: 8, accentColor: "#00C9B1" }}
-            />
-            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#6C8E96", marginBottom: 30 }}>
-              <span>20 л — нано</span><span>350+ л — большой</span>
-            </div>
+
+            {!calcMode && (
+              <>
+                <div style={{ textAlign: "center", fontSize: 40, fontWeight: 800, color: "#00C9B1", marginBottom: 6 }}>
+                  {volume} л
+                </div>
+                <input
+                  type="range"
+                  min={20}
+                  max={350}
+                  step={10}
+                  value={volume}
+                  onChange={(e) => setVolume(Number(e.target.value))}
+                  style={{ width: "100%", marginBottom: 8, accentColor: "#00C9B1" }}
+                />
+                <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#6C8E96", marginBottom: 30 }}>
+                  <span>20 л — нано</span><span>350+ л — большой</span>
+                </div>
+              </>
+            )}
+
+            {calcMode && (
+              <>
+                <p style={{ fontSize: 12, color: "#6C8E96", marginBottom: 14 }}>
+                  Измерьте аквариум изнутри (или возьмите размеры с коробки) — посчитаем литраж автоматически.
+                </p>
+                <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                  {[
+                    { label: "Длина, см", val: dimL, set: setDimL },
+                    { label: "Ширина, см", val: dimW, set: setDimW },
+                    { label: "Высота, см", val: dimH, set: setDimH },
+                  ].map((d) => (
+                    <div key={d.label} style={{ flex: 1 }}>
+                      <label style={{ fontSize: 10.5, color: "#6C8E96", display: "block", marginBottom: 4 }}>{d.label}</label>
+                      <input
+                        type="number"
+                        min={5}
+                        max={300}
+                        value={d.val}
+                        onChange={(e) => d.set(Math.max(0, Number(e.target.value)))}
+                        style={{ width: "100%", background: "#102433", border: "1px solid #1C3A4A", borderRadius: 10, padding: "9px 8px", color: "#E8F4F8", fontSize: 14, fontWeight: 700, textAlign: "center", outline: "none" }}
+                      />
+                    </div>
+                  ))}
+                </div>
+                <div style={{ textAlign: "center", background: "#0F2A26", border: "1px solid #00C9B144", borderRadius: 12, padding: "12px", marginBottom: 18 }}>
+                  <div style={{ fontSize: 11, color: "#6C8E96", marginBottom: 2 }}>Объём по формуле Д×Ш×В</div>
+                  <div style={{ fontSize: 28, fontWeight: 800, color: "#00C9B1" }}>≈ {calcVolume} л</div>
+                  <div style={{ fontSize: 10.5, color: "#6C8E96", marginTop: 2 }}>фактический объём воды обычно на 10–15% меньше (грунт, декор, уровень воды)</div>
+                </div>
+                <button onClick={applyCalcVolume} style={{ ...primaryBtn, marginBottom: 30, background: "#0F2A26", color: "#00C9B1", border: "1px solid #00C9B1" }}>
+                  Использовать {Math.max(20, Math.min(350, calcVolume || 20))} л
+                </button>
+              </>
+            )}
+
             <button onClick={goNext} style={primaryBtn}>Далее →</button>
           </>
         )}
@@ -5099,8 +5837,15 @@ const SEED_ORDERS = [
   },
 ];
 
-function WaterReminder({ days }) {
+function WaterReminder({ days, tankName, notifEnabled = true }) {
   const urgent = days >= 7;
+  const [sent, setSent] = useState(false);
+  async function handleRemind() {
+    if (!notifEnabled) return;
+    const ok = await notifyTelegram("water_reminder", { tankName, daysAgo: days });
+    setSent(true);
+    setTimeout(() => setSent(false), 2500);
+  }
   return (
     <div
       style={{
@@ -5119,19 +5864,34 @@ function WaterReminder({ days }) {
         {urgent ? "⚠️ Пора менять воду! " : "💧 "}Последняя смена воды: {days} {days === 1 ? "день" : "дней"} назад
       </span>
       {urgent && (
-        <span style={{ color: "#FF6B6B", fontWeight: 700, whiteSpace: "nowrap", marginLeft: 8 }}>
-          Напомнить
+        <span
+          onClick={handleRemind}
+          style={{ color: sent ? "#00C9B1" : "#FF6B6B", fontWeight: 700, whiteSpace: "nowrap", marginLeft: 8, cursor: "pointer" }}
+        >
+          {sent ? "✓ Отправлено в Telegram" : "Напомнить"}
         </span>
       )}
     </div>
   );
 }
 
-function Profile({ onBack, onOpenCatalog, orders = [], userTanks = [], setUserTanks, onTrackOrder, onOpenDoctor, onOpenDiary, onOpenSeller, onOpenCourier, onOpenClub, onOpenAdmin }) {
-  const [tab, setTab] = useState("tanks"); // tanks | orders | favorites
+function Profile({ onBack, onOpenCatalog, orders = [], userTanks = [], setUserTanks, onTrackOrder, onRepeatOrder, onCreateTankFromOrder, onOpenDoctor, onOpenDiary, onOpenSeller, onOpenCourier, onOpenClub, onOpenAdmin, wishlist = [], onToggleWishlist, onAddToCart, subscriptions = [], onCancelSubscription, onTogglePauseSubscription, notifPrefs, onUpdateNotifPref, initialTab }) {
+  const [tab, setTab] = useState(initialTab || "tanks"); // tanks | orders | favorites
   const [newTankModal, setNewTankModal] = useState(false);
   const [tankName, setTankName] = useState("");
   const [tankVolume, setTankVolume] = useState(100);
+  const wishlistAlerts = useMemo(() => getWishlistAlerts(wishlist), [wishlist]);
+  useEffect(() => { notifyWishlistAlerts(wishlist); }, [wishlist]);
+
+  // Локальный тост профиля — для действий, у которых нет своего экрана-подтверждения
+  // (повтор заказа, создание дневника из заказа, новый аквариум и т.п.)
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
+  function showToast(text, type = "ok") {
+    setToast({ text, type });
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 2200);
+  }
 
   function createNewTank() {
     if (!tankName.trim()) return;
@@ -5146,13 +5906,14 @@ function Profile({ onBack, onOpenCatalog, orders = [], userTanks = [], setUserTa
     setNewTankModal(false);
     setTankName("");
     setTankVolume(100);
+    showToast(`✅ Аквариум «${newTank.name}» создан`, "ok");
   }
 
   return (
     <div style={{ minHeight: "100vh", background: "#08131F", color: "#E8F4F8", paddingBottom: 30 }}>
       <div style={{ padding: "16px 16px 0" }}>
         <button onClick={onBack} style={{ background: "none", border: "none", color: "#9FC4CC", fontSize: 14, marginBottom: 14, cursor: "pointer" }}>
-          ← Назад в каталог
+          ← На главную
         </button>
 
         <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 18 }}>
@@ -5182,6 +5943,8 @@ function Profile({ onBack, onOpenCatalog, orders = [], userTanks = [], setUserTa
             ["tanks", "🐠 Мои аквариумы"],
             ["orders", "📦 Заказы"],
             ["favorites", "❤️ Избранное"],
+            ["subscriptions", "🔁 Подписки"],
+            ["rewards", "🎁 Награды"],
           ].map(([id, label]) => (
             <button
               key={id}
@@ -5235,7 +5998,7 @@ function Profile({ onBack, onOpenCatalog, orders = [], userTanks = [], setUserTa
                     </span>
                   ))}
                 </div>
-                <WaterReminder days={t.lastWaterChange} />
+                <WaterReminder days={t.lastWaterChange} tankName={t.name} notifEnabled={notifPrefs ? notifPrefs.water : true} />
               </div>
             ))}
 
@@ -5265,7 +6028,8 @@ function Profile({ onBack, onOpenCatalog, orders = [], userTanks = [], setUserTa
               </div>
             )}
             {orders.map((o) => {
-              const fishItems = o.items.filter((it) => it.type === "fish");
+              const items = Array.isArray(o.items) ? o.items : [];
+              const fishItems = items.filter((it) => it.type === "fish");
               const statusInfo = ORDER_STATUSES.find((s) => s.key === o.status) || { label: o.status || "Принят", icon: "✅" };
               const isActive = o.status && o.status !== "delivered";
               return (
@@ -5284,11 +6048,11 @@ function Profile({ onBack, onOpenCatalog, orders = [], userTanks = [], setUserTa
                     <span style={{ fontSize: 12, color: "#6C8E96" }}>{o.date}</span>
                   </div>
                   <div style={{ display: "flex", gap: 10, marginBottom: 10, flexWrap: "wrap" }}>
-                    {o.items.map((it, idx) => (
+                    {items.map((it, idx) => (
                       <span key={(it.id || it.name) + idx} style={{ fontSize: 22 }} title={it.name}>{it.img}</span>
                     ))}
                     <span style={{ fontSize: 12, color: "#9FC4CC", alignSelf: "center" }}>
-                      {o.items.length} {o.items.length === 1 ? "товар" : "товара"}
+                      {items.length} {items.length === 1 ? "товар" : "товара"}
                     </span>
                   </div>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -5324,22 +6088,24 @@ function Profile({ onBack, onOpenCatalog, orders = [], userTanks = [], setUserTa
                         {isActive ? "🚚 Отслеживать" : "📦 Детали заказа"}
                       </button>
                     )}
-                    <button
-                      onClick={() => onRepeatOrder(o)}
-                      style={{
-                        flex: 1,
-                        background: "#102433",
-                        border: "1px solid #1C3A4A",
-                        color: "#9FC4CC",
-                        borderRadius: 10,
-                        padding: "8px",
-                        fontSize: 12.5,
-                        cursor: "pointer",
-                      }}
-                    >
-                      Повторить заказ
-                    </button>
-                    {fishItems.length > 0 && (
+                    {onRepeatOrder && (
+                      <button
+                        onClick={() => onRepeatOrder(o)}
+                        style={{
+                          flex: 1,
+                          background: "#102433",
+                          border: "1px solid #1C3A4A",
+                          color: "#9FC4CC",
+                          borderRadius: 10,
+                          padding: "8px",
+                          fontSize: 12.5,
+                          cursor: "pointer",
+                        }}
+                      >
+                        Повторить заказ
+                      </button>
+                    )}
+                    {fishItems.length > 0 && onCreateTankFromOrder && (
                       <button
                         onClick={() => onCreateTankFromOrder(o)}
                         style={{
@@ -5364,10 +6130,194 @@ function Profile({ onBack, onOpenCatalog, orders = [], userTanks = [], setUserTa
         )}
 
         {tab === "favorites" && (
-          <div style={{ textAlign: "center", color: "#6C8E96", fontSize: 13, marginTop: 40 }}>
-            ❤️ Пока нет избранного — отмечайте рыб сердечком в каталоге
-          </div>
+          wishlist.length === 0 ? (
+            <div style={{ textAlign: "center", color: "#6C8E96", fontSize: 13, marginTop: 40 }}>
+              ❤️ Пока нет избранного — отмечайте товары сердечком в каталоге
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {wishlist.map((f) => {
+                const alert = wishlistAlerts.find((a) => a.item.id === f.id && a.type === "price_drop");
+                return (
+                <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 12, background: "#0E2030", border: `1px solid ${alert ? "#51CF6666" : "#1C3A4A"}`, borderRadius: 14, padding: "10px 12px" }}>
+                  <span style={{ fontSize: 28, width: 46, height: 46, borderRadius: 12, background: "#102433", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{f.img}</span>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</div>
+                    {alert ? (
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 2 }}>
+                        <span style={{ fontSize: 12.5, color: "#51CF66", fontWeight: 800 }}>{formatSum(alert.live.price)}</span>
+                        <span style={{ fontSize: 11, color: "#6C8E96", textDecoration: "line-through" }}>{formatSum(f.price)}</span>
+                        <span style={{ fontSize: 10, background: "#0F2A26", color: "#51CF66", border: "1px solid #51CF6666", borderRadius: 999, padding: "1px 6px", fontWeight: 800 }}>−{alert.pct}%</span>
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: 12.5, color: "#F0A93C", fontWeight: 700, marginTop: 2 }}>{formatSum(f.price)}</div>
+                    )}
+                  </div>
+                  {onAddToCart && (
+                    <button onClick={() => onAddToCart(f)} style={{ background: "#00C9B1", border: "none", borderRadius: 10, padding: "7px 10px", color: "#08131F", fontSize: 12, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}>+ 🛒</button>
+                  )}
+                  {onToggleWishlist && (
+                    <button onClick={() => onToggleWishlist(f)} style={{ background: "none", border: "none", color: "#FF6B6B", fontSize: 16, cursor: "pointer", padding: "4px 2px" }}>🗑️</button>
+                  )}
+                </div>
+              );})}
+            </div>
+          )
         )}
+
+        {tab === "subscriptions" && (
+          subscriptions.length === 0 ? (
+            <div style={{ textAlign: "center", color: "#6C8E96", fontSize: 13, marginTop: 40 }}>
+              🔁 Нет активных подписок — оформите подписку на корм в карточке товара и получайте скидку 10% на каждую доставку
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {subscriptions.map((s) => {
+                const intervalLabel = (SUBSCRIPTION_INTERVALS.find((o) => o.weeks === s.intervalWeeks) || {}).label || `Каждые ${s.intervalWeeks} нед.`;
+                const discountedPrice = Math.round(s.product.price * (1 - SUBSCRIPTION_DISCOUNT));
+                return (
+                  <div key={s.id} style={{ background: "#0E2030", border: "1px solid #1C3A4A", borderRadius: 14, padding: "12px 12px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                      <span style={{ fontSize: 28, width: 46, height: 46, borderRadius: 12, background: "#102433", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{s.product.img}</span>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13.5, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{s.product.name}</div>
+                        <div style={{ fontSize: 12, color: "#6C8E96", marginTop: 2 }}>{intervalLabel}</div>
+                      </div>
+                      <div style={{ textAlign: "right" }}>
+                        <div style={{ fontSize: 12.5, color: "#F0A93C", fontWeight: 700 }}>{formatSum(discountedPrice)}</div>
+                        <div style={{ fontSize: 10.5, color: "#6C8E96", textDecoration: "line-through" }}>{formatSum(s.product.price)}</div>
+                      </div>
+                    </div>
+                    <div style={{
+                      marginTop: 10, fontSize: 12, color: s.paused ? "#F0A93C" : "#00C9B1",
+                      background: s.paused ? "#2A2210" : "#0F2A26",
+                      border: `1px solid ${s.paused ? "#F0A93C44" : "#00C9B144"}`,
+                      borderRadius: 9, padding: "7px 10px",
+                    }}>
+                      {s.paused ? "⏸ Подписка на паузе" : `📅 Следующая доставка: ${fmtDate(s.nextDate)}`}
+                    </div>
+                    <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                      {onTogglePauseSubscription && (
+                        <button
+                          onClick={() => onTogglePauseSubscription(s.id)}
+                          style={{ flex: 1, background: "#102433", border: "1px solid #1C3A4A", borderRadius: 9, padding: "8px", color: "#9FC4CC", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+                        >
+                          {s.paused ? "▶️ Возобновить" : "⏸ Поставить на паузу"}
+                        </button>
+                      )}
+                      {onCancelSubscription && (
+                        <button
+                          onClick={() => onCancelSubscription(s.id)}
+                          style={{ background: "none", border: "1px solid #FF6B6B44", borderRadius: 9, padding: "8px 12px", color: "#FF6B6B", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+                        >
+                          Отменить
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )
+        )}
+
+        {tab === "rewards" && (() => {
+          const rewardPromos = getRewardPromos();
+          const entries = Object.entries(rewardPromos).sort((a, b) => (b[1].usedAt ? 0 : 1) - (a[1].usedAt ? 0 : 1));
+          if (entries.length === 0) {
+            return (
+              <div style={{ textAlign: "center", color: "#6C8E96", fontSize: 13, marginTop: 40 }}>
+                🎁 Пока нет наград — открывайте бейджи в дневнике аквариума, и сюда будут падать рабочие промокоды на скидку
+              </div>
+            );
+          }
+          return (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {entries.map(([code, r]) => {
+                const used = !!r.usedAt;
+                return (
+                  <div key={code} style={{
+                    background: "#0E2030", border: `1px solid ${used ? "#1C3A4A" : "#F0A93C44"}`,
+                    borderRadius: 14, padding: "12px 14px", opacity: used ? 0.55 : 1,
+                  }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700 }}>{r.label}</div>
+                      <span style={{
+                        fontSize: 10, fontWeight: 800, borderRadius: 999, padding: "2px 8px", whiteSpace: "nowrap",
+                        background: used ? "#1C3A4A" : "#F0A93C22", color: used ? "#6C8E96" : "#F0A93C",
+                      }}>
+                        {used ? "Использован" : "Доступен"}
+                      </span>
+                    </div>
+                    <div style={{ fontSize: 13.5, fontWeight: 800, color: "#00C9B1", letterSpacing: 0.5, marginTop: 6 }}>{code}</div>
+                    <div style={{ fontSize: 11.5, color: "#6C8E96", marginTop: 4 }}>
+                      −{r.percent}% · от {formatSum(r.minOrderSum || 0)}
+                      {used && r.usedAt ? ` · применён ${fmtDate(r.usedAt)}` : ""}
+                    </div>
+                    {!used && (
+                      <button
+                        onClick={() => navigator.clipboard?.writeText(code)}
+                        style={{ marginTop: 8, width: "100%", background: "#102433", border: "1px solid #1C3A4A", borderRadius: 9, padding: "7px", color: "#9FC4CC", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+                      >
+                        📋 Скопировать код
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          );
+        })()}
+
+        {/* ---- Уведомления (Telegram push) ---- */}
+        <div style={{ marginTop: 28, marginBottom: 8 }}>
+          <div style={{ fontSize: 11, color: "#6C8E96", fontWeight: 700, letterSpacing: 1.2, textTransform: "uppercase", marginBottom: 12 }}>
+            🔔 Уведомления в Telegram
+          </div>
+          {!tgUser?.id && (
+            <div style={{
+              background: "#2A2210", border: "1px solid #F0A93C44", borderRadius: 12,
+              padding: "10px 12px", fontSize: 12, color: "#F0A93C", marginBottom: 10, lineHeight: 1.5,
+            }}>
+              ⚠️ Откройте AquaMarjon через Telegram-бота, чтобы получать пуши — сейчас приложение открыто в браузере.
+            </div>
+          )}
+          <div style={{ background: "#0E2030", border: "1px solid #1C3A4A", borderRadius: 14, overflow: "hidden" }}>
+            {[
+              { key: "water", icon: "💧", label: "Напоминания о смене воды", sub: "Когда пора менять воду в аквариуме" },
+              { key: "delivery", icon: "🚚", label: "Статус доставки", sub: "Принят · Собран · В пути · Доставлен" },
+              { key: "arrivals", icon: "🐠", label: "Новые поступления рыб", sub: "Когда привозят редкие или популярные виды" },
+            ].map((row, i) => (
+              <div
+                key={row.key}
+                style={{
+                  display: "flex", alignItems: "center", gap: 12, padding: "12px 14px",
+                  borderTop: i === 0 ? "none" : "1px solid #1C3A4A",
+                }}
+              >
+                <span style={{ fontSize: 20 }}>{row.icon}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700 }}>{row.label}</div>
+                  <div style={{ fontSize: 11, color: "#6C8E96", marginTop: 2 }}>{row.sub}</div>
+                </div>
+                <button
+                  onClick={() => onUpdateNotifPref && onUpdateNotifPref(row.key, !(notifPrefs && notifPrefs[row.key]))}
+                  style={{
+                    width: 40, height: 24, borderRadius: 12, border: "none", cursor: "pointer", flexShrink: 0,
+                    background: notifPrefs && notifPrefs[row.key] ? "#00C9B1" : "#1C3A4A",
+                    position: "relative", transition: "background 0.15s",
+                  }}
+                >
+                  <span style={{
+                    position: "absolute", top: 3, left: notifPrefs && notifPrefs[row.key] ? 19 : 3,
+                    width: 18, height: 18, borderRadius: "50%", background: "#08131F",
+                    transition: "left 0.15s",
+                  }} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
 
         {/* ---- Сервисы ---- */}
         <div style={{ marginTop: 28, marginBottom: 8 }}>
@@ -5498,6 +6448,7 @@ function Profile({ onBack, onOpenCatalog, orders = [], userTanks = [], setUserTa
           </div>
         </div>
       )}
+      <Toast toast={toast} />
     </div>
   );
 }
@@ -5988,6 +6939,12 @@ function SellerCabinet({ onBack }) {
           onPublish={newProduct => {
             setProducts(ps => [...ps, newProduct]);
             setTab("products");
+            // Сообщаем бэкенду о новом поступлении — рассылка подписчикам
+            // (telegram_id всех, у кого включены уведомления "arrivals")
+            // выполняется на сервере; здесь только триггер события.
+            if (newProduct.active && newProduct.category === "fish") {
+              notifyTelegram("new_arrival", { name: newProduct.name, price: newProduct.price, emoji: newProduct.emoji });
+            }
           }}
         />
       )}
@@ -6184,11 +7141,10 @@ function DocStepSymptoms({ fishName, onNext, onBack }) {
   );
 }
 
-function DocStepDiagnosis({ fishName, data, onBack, onReset }) {
+function DocStepDiagnosis({ fishName, data, onBack, onReset, cart, setCart, onOpenChat }) {
   const [result,setResult]=useState(null);
   const [loading,setLoading]=useState(false);
   const [error,setError]=useState(null);
-  const [addedToCart,setAddedToCart]=useState([]);
   const ran=useRef(false);
 
   const symptomLabels=data.symptoms.map(id=>SYMPTOMS_DOCTOR.find(s=>s.id===id)?.label).filter(Boolean);
@@ -6281,7 +7237,7 @@ function DocStepDiagnosis({ fishName, data, onBack, onReset }) {
         <>
           <div style={{fontSize:13,fontWeight:700,color:Pd.soft,marginBottom:8}}>💊 Лекарства из нашего магазина:</div>
           {recommendedMeds.map(med=>{
-            const inCart=addedToCart.includes(med.id);
+            const inCart=(cart||[]).some(c=>c.id===med.id);
             return(
               <div key={med.id} style={{background:Pd.card,border:`1px solid ${inCart?Pd.teal+"66":Pd.border}`,borderRadius:14,padding:"12px 14px",marginBottom:10,display:"flex",alignItems:"center",gap:12,transition:"border-color 0.2s"}}>
                 <span style={{fontSize:24,width:44,height:44,borderRadius:12,background:"#102433",border:`1px solid ${Pd.border}`,display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0}}>{med.img}</span>
@@ -6289,15 +7245,19 @@ function DocStepDiagnosis({ fishName, data, onBack, onReset }) {
                   <div style={{fontSize:13.5,fontWeight:700}}>{med.name}</div>
                   <div style={{fontSize:13,color:Pd.amber,fontWeight:700}}>{med.price.toLocaleString("ru-RU")} сум</div>
                 </div>
-                <button onClick={()=>setAddedToCart(p=>inCart?p.filter(x=>x!==med.id):[...p,med.id])} style={{background:inCart?Pd.teal:"transparent",border:`1px solid ${inCart?Pd.teal:Pd.border}`,borderRadius:10,padding:"7px 12px",color:inCart?"#08131F":Pd.soft,fontSize:12.5,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
+                <button onClick={()=>{
+                  if(!setCart) return;
+                  if(inCart){ setCart(c=>{const idx=c.findIndex(x=>x.id===med.id); if(idx===-1) return c; const copy=[...c]; copy.splice(idx,1); return copy;}); }
+                  else { setCart(c=>[...c, {id:med.id, type:"medicine", name:med.name, price:med.price, img:med.img, color:"#00C9B1", rating:4.9}]); }
+                }} style={{background:inCart?Pd.teal:"transparent",border:`1px solid ${inCart?Pd.teal:Pd.border}`,borderRadius:10,padding:"7px 12px",color:inCart?"#08131F":Pd.soft,fontSize:12.5,fontWeight:700,cursor:"pointer",whiteSpace:"nowrap"}}>
                   {inCart?"✓ В корзине":"+ В корзину"}
                 </button>
               </div>
             );
           })}
-          {addedToCart.length>0&&(
+          {(cart||[]).some(c=>recommendedMeds.some(m=>m.id===c.id))&&(
             <div style={{background:Pd.successBg,border:`1px solid ${Pd.teal}44`,borderRadius:12,padding:"10px 14px",marginBottom:14,fontSize:13,color:Pd.teal,textAlign:"center"}}>
-              ✅ {addedToCart.length} {addedToCart.length===1?"лекарство":"лекарства"} добавлено
+              ✅ Лекарства добавлены в корзину — оформите заказ в каталоге
             </div>
           )}
         </>
@@ -6306,8 +7266,13 @@ function DocStepDiagnosis({ fishName, data, onBack, onReset }) {
         🛡 <strong style={{color:Pd.teal}}>Профилактика:</strong> {result.prevention}
       </div>
       {result.confidence<65&&(
-        <div style={{background:Pd.dangerBg,border:`1px solid ${Pd.danger}44`,borderRadius:12,padding:"10px 14px",marginBottom:14,fontSize:12.5,color:"#FF8F8F",lineHeight:1.5}}>
-          ⚠️ Уверенность AI ниже 65% — рекомендуем проконсультироваться с нашим специалистом в чате.
+        <div style={{background:Pd.dangerBg,border:`1px solid ${Pd.danger}44`,borderRadius:12,padding:"12px 14px",marginBottom:14,fontSize:12.5,color:"#FF8F8F",lineHeight:1.5}}>
+          <div style={{marginBottom:10}}>⚠️ Уверенность AI ниже 65% — рекомендуем проконсультироваться с нашим специалистом.</div>
+          {onOpenChat && (
+            <button onClick={onOpenChat} style={{width:"100%",background:Pd.danger,border:"none",borderRadius:10,padding:"10px",color:"#08131F",fontSize:13,fontWeight:700,cursor:"pointer"}}>
+              💬 Написать живому консультанту
+            </button>
+          )}
         </div>
       )}
       <DBtn variant="ghost" onClick={onReset}>🔄 Новая диагностика</DBtn>
@@ -6315,12 +7280,15 @@ function DocStepDiagnosis({ fishName, data, onBack, onReset }) {
   );
 }
 
-function FishDoctorScreen({ onBack }) {
+function FishDoctorScreen({ onBack, cart, setCart }) {
   const [step,setStep]=useState(1);
   const [fishName,setFishName]=useState("");
   const [diagData,setDiagData]=useState(null);
+  const [chatOpen,setChatOpen]=useState(false);
+  const [autoEscalate,setAutoEscalate]=useState(false);
   const stepLabels=["Рыба","Симптомы","Диагноз"];
   function reset(){setStep(1);setFishName("");setDiagData(null);}
+  function openLiveChat(){ setAutoEscalate(true); setChatOpen(true); }
   return(
     <div style={{minHeight:"100vh",background:Pd.bg,color:Pd.text,paddingBottom:40}}>
       <div style={{background:Pd.card,borderBottom:`1px solid ${Pd.border}`,padding:"16px 16px 14px",position:"relative",overflow:"hidden"}}>
@@ -6351,11 +7319,12 @@ function FishDoctorScreen({ onBack }) {
       <div style={{padding:"16px 16px 0"}}>
         {step===1&&<DocStepFish onNext={name=>{setFishName(name);setStep(2);}}/>}
         {step===2&&<DocStepSymptoms fishName={fishName} onNext={data=>{setDiagData(data);setStep(3);}} onBack={()=>setStep(1)}/>}
-        {step===3&&diagData&&<DocStepDiagnosis fishName={fishName} data={diagData} onBack={()=>setStep(2)} onReset={reset}/>}
+        {step===3&&diagData&&<DocStepDiagnosis fishName={fishName} data={diagData} onBack={()=>setStep(2)} onReset={reset} cart={cart} setCart={setCart} onOpenChat={openLiveChat}/>}
       </div>
       <div style={{padding:"20px 16px 0",fontSize:11.5,color:Pd.muted,textAlign:"center",lineHeight:1.6}}>
-        AI-диагностика не заменяет специалиста. При тяжёлых симптомах — напишите нам в чат.
+        AI-диагностика не заменяет специалиста. При тяжёлых симптомах — <span onClick={openLiveChat} style={{color:Pd.teal,cursor:"pointer",textDecoration:"underline"}}>напишите нам в чат</span>.
       </div>
+      <AIChatWidget cart={cart||[]} open={chatOpen} onOpenChange={(v)=>{setChatOpen(v); if(!v) setAutoEscalate(false);}} autoEscalate={autoEscalate} />
     </div>
   );
 }
@@ -6371,13 +7340,34 @@ const Dp = {
   dangerBg: "#2A1414", successBg: "#0F2A26",
 };
 
+// Удержание/онбординг: сразу после первого заказа с рыбами предлагаем создать
+// дневник аквариума с автозаполнением рыб из корзины — именно вовлечение в
+// дневник в первую неделю определяет, вернётся ли человек.
+const PENDING_DIARY_TANK_KEY = "aqua_pending_diary_tank";
+
+function buildTankDraftFromCart(fishItems) {
+  return {
+    id: "tank_" + Date.now(),
+    name: "Новый аквариум",
+    volume: 100,
+    emoji: "🌿",
+    fish: fishItems.map((f, i) => ({ id: "tf_" + Date.now() + "_" + i, name: f.name, img: f.img, qty: 1, status: "ok" })),
+    logs: [],
+    waterChangeEvery: 7, lastWaterChange: 0,
+    filterCleanEvery: 30, lastFilterClean: 0,
+    feedingSchedule: "2 раза в день", notes: "", temperature: 25, ph: 7.0,
+  };
+}
+
 const DIARY_SEED_TANKS = [
   {
     id: "dt1", name: "Гостиная", volume: 120, emoji: "🌿",
+    careSinceISO: "2026-03-15", // с какой даты ведётся учёт «без потерь»
+    lastLossISO: null,          // дата последней гибели рыбы (null = ни одной потери)
     fish: [
-      { id: "guppy", name: "Гуппи «Огненный хвост»", qty: 5, img: "🐠", temp: [22,28], lifespan: "3–5 лет", addedDate: "15 мая" },
-      { id: "neon",  name: "Неон «Голубая искра»",   qty: 12, img: "🐟", temp: [20,26], lifespan: "4–6 лет", addedDate: "15 мая" },
-      { id: "ancistrus", name: "Анциструс «Чистильщик»", qty: 2, img: "🐡", temp: [22,27], lifespan: "8–10 лет", addedDate: "20 мая" },
+      { id: "guppy", name: "Гуппи «Огненный хвост»", qty: 5, img: "🐠", temp: [22,28], lifespan: "3–5 лет", addedDate: "15 мая", status: "alive" },
+      { id: "neon",  name: "Неон «Голубая искра»",   qty: 12, img: "🐟", temp: [20,26], lifespan: "4–6 лет", addedDate: "15 мая", status: "alive" },
+      { id: "ancistrus", name: "Анциструс «Чистильщик»", qty: 2, img: "🐡", temp: [22,27], lifespan: "8–10 лет", addedDate: "20 мая", status: "alive" },
     ],
     logs: [
       { id: "l1", date: "23 июня", type: "water", note: "Смена 30% воды, добавил кондиционер", temp: 25 },
@@ -6400,8 +7390,10 @@ const DIARY_SEED_TANKS = [
   },
   {
     id: "dt2", name: "Спальня — нано", volume: 40, emoji: "👑",
+    careSinceISO: "2026-02-01",
+    lastLossISO: null,
     fish: [
-      { id: "betta", name: "Петушок «Королевский бархат»", qty: 1, img: "👑", temp: [24,29], lifespan: "2–4 года", addedDate: "1 июня" },
+      { id: "betta", name: "Петушок «Королевский бархат»", qty: 1, img: "👑", temp: [24,29], lifespan: "2–4 года", addedDate: "1 июня", status: "alive" },
     ],
     logs: [
       { id: "l5", date: "24 июня", type: "water", note: "Смена 20% воды", temp: 27 },
@@ -6427,6 +7419,436 @@ const DIARY_LOG_TYPES = [
   { id: "health", icon: "🩺", label: "Здоровье",     color: "#F86B6B" },
   { id: "note",   icon: "📝", label: "Заметка",      color: "#9FC4CC" },
 ];
+
+/* ============================================================
+   🏅 ГЕЙМИФИКАЦИЯ ДНЕВНИКА — стрики, уровни с названиями, тиры бейджей
+   ============================================================ */
+const RU_MONTHS_GEN = ["января","февраля","марта","апреля","мая","июня","июля","августа","сентября","октября","ноября","декабря"];
+function formatDiaryDate(iso) {
+  if (!iso) return "";
+  const d = new Date(iso + "T00:00:00");
+  if (isNaN(d.getTime())) return iso; // на случай старого формата строки
+  return `${d.getDate()} ${RU_MONTHS_GEN[d.getMonth()]}`;
+}
+function diaryTodayISO() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+// Считает текущую и лучшую серию дней подряд, в которые была хотя бы одна запись
+function computeDiaryStreaks(allDates) {
+  const dates = Array.from(allDates).sort();
+  if (dates.length === 0) return { current: 0, best: 0 };
+  let best = 1, run = 1;
+  for (let i = 1; i < dates.length; i++) {
+    const prev = new Date(dates[i - 1] + "T00:00:00");
+    const next = new Date(dates[i] + "T00:00:00");
+    const diffDays = Math.round((next.getTime() - prev.getTime()) / 86400000);
+    if (diffDays === 1) run++;
+    else if (diffDays > 1) run = 1;
+    best = Math.max(best, run);
+  }
+  return { current: run, best }; // current = серия, заканчивающаяся последней записью
+}
+
+const TIER_NAMES = ["Бронза", "Серебро", "Золото"];
+const TIER_COLORS = ["#CD7F32", "#C0C8D2", "#FFD24A"];
+
+// Каждый бейдж имеет 3 порога (бронза/серебро/золото)
+const DIARY_BADGES = [
+  { id: "streak",      icon: "🔥", title: "Серия ухода",          desc: "Дней подряд с записью в дневнике",   metric: (s) => s.bestStreak,     tiers: [3, 7, 30] },
+  { id: "punctual",    icon: "⏱️", title: "Пунктуальность",       desc: "Уход выполнен вовремя (до просрочки)", metric: (s) => s.onTimeCare,   tiers: [5, 15, 40] },
+  { id: "water_master",icon: "💧", title: "Мастер воды",          desc: "Смен воды",                          metric: (s) => s.water,          tiers: [10, 30, 100] },
+  { id: "clean_freak", icon: "🧹", title: "Чистюля",              desc: "Чисток стёкол и фильтра",            metric: (s) => s.clean,          tiers: [5, 15, 50] },
+  { id: "feeder",      icon: "🍽️", title: "Кормилец",             desc: "Записей о кормлении",                metric: (s) => s.feed,           tiers: [5, 20, 60] },
+  { id: "vet",         icon: "🩺", title: "Аквариумный врач",     desc: "Записей о здоровье рыб",             metric: (s) => s.health,         tiers: [3, 10, 25] },
+  { id: "marathoner",  icon: "📔", title: "Марафонец дневника",   desc: "Записей всего",                      metric: (s) => s.totalLogs,      tiers: [20, 75, 200] },
+  { id: "collector",   icon: "🐠", title: "Коллекционер",         desc: "Рыб в коллекции",                    metric: (s) => s.totalFish,      tiers: [15, 40, 100] },
+  { id: "keeper",      icon: "🏠", title: "Хранитель аквариумов", desc: "Аквариумов в дневнике",              metric: (s) => s.tankCount,      tiers: [2, 4, 7] },
+  { id: "big_house",   icon: "🪸", title: "Большой дом",          desc: "Объём крупнейшего аквариума (л)",    metric: (s) => s.maxVolume,      tiers: [100, 150, 250] },
+  { id: "versatile",   icon: "🌈", title: "Разносторонний уход",  desc: "Типов записей использовано",         metric: (s) => s.typesUsedCount, tiers: [3, 4, 5] },
+  { id: "guardian",    icon: "🛡️", title: "Хранитель жизни",      desc: "Месяцев подряд без потери ни одной рыбы", metric: (s) => s.monthsNoLoss, tiers: [1, 3, 6] },
+];
+
+// Считает, сколько месяцев подряд во всех аквариумах не погибало ни одной рыбы.
+// «Слабым звеном» считается аквариум с самой недавней потерей (или началом учёта).
+function diaryMonthsNoLoss(tanks) {
+  if (!tanks || tanks.length === 0) return 0;
+  let minMonths = Infinity;
+  tanks.forEach(t => {
+    const ref = t.lastLossISO || t.careSinceISO;
+    if (!ref) return; // нет данных по этому аквариуму — не учитываем в расчёте
+    const days = diaryDaysSince(ref);
+    minMonths = Math.min(minMonths, Math.floor(days / 30));
+  });
+  return Number.isFinite(minMonths) ? Math.max(0, minMonths) : 0;
+}
+
+function computeDiaryStats(tanks) {
+  let totalLogs = 0, water = 0, clean = 0, feed = 0, health = 0, note = 0;
+  let totalFish = 0, maxVolume = 0, onTimeCare = 0;
+  const typesUsed = new Set();
+  const allDates = new Set();
+  tanks.forEach(t => {
+    totalFish += t.fish.reduce((s, f) => s + (f.status === "lost" ? 0 : f.qty), 0);
+    maxVolume = Math.max(maxVolume, t.volume);
+    t.logs.forEach(l => {
+      totalLogs++;
+      typesUsed.add(l.type);
+      if (l.date) allDates.add(l.date);
+      if (l.type === "water") water++;
+      else if (l.type === "clean") clean++;
+      else if (l.type === "feed") feed++;
+      else if (l.type === "health") health++;
+      else if (l.type === "note") note++;
+      if (l.onTime && (l.type === "water" || l.type === "clean")) onTimeCare++;
+    });
+  });
+  const streaks = computeDiaryStreaks(allDates);
+  const monthsNoLoss = diaryMonthsNoLoss(tanks);
+  return {
+    totalLogs, water, clean, feed, health, note, onTimeCare,
+    tankCount: tanks.length, totalFish, maxVolume, typesUsedCount: typesUsed.size,
+    currentStreak: streaks.current, bestStreak: streaks.best, monthsNoLoss,
+  };
+}
+
+// Возвращает индекс достигнутого тира (-1 если ни одного), прогресс к следующему
+function getBadgeTier(badge, stats) {
+  const val = badge.metric(stats);
+  let tierIndex = -1;
+  for (let i = 0; i < badge.tiers.length; i++) {
+    if (val >= badge.tiers[i]) tierIndex = i;
+  }
+  const maxed = tierIndex === badge.tiers.length - 1;
+  const nextTarget = maxed ? badge.tiers[tierIndex] : badge.tiers[tierIndex + 1];
+  const prevTarget = tierIndex >= 0 ? badge.tiers[tierIndex] : 0;
+  const span = nextTarget - prevTarget || 1;
+  const pctToNext = maxed ? 1 : Math.min(Math.max((val - prevTarget) / span, 0), 1);
+  return { tierIndex, val, maxed, nextTarget, pctToNext, earned: tierIndex >= 0 };
+}
+
+function diaryEarnedBadgeKeys(stats) {
+  // Ключ вида "id:tierIndex" — нужен чтобы ловить именно повышение тира, а не только первое получение
+  return DIARY_BADGES.map(b => {
+    const { tierIndex } = getBadgeTier(b, stats);
+    return tierIndex >= 0 ? `${b.id}:${tierIndex}` : null;
+  }).filter(Boolean);
+}
+
+// Находит ближайший недостигнутый тир бейджа (минимальное число действий до получения)
+function diaryNearestNextBadge(stats) {
+  let best = null;
+  DIARY_BADGES.forEach(b => {
+    const t = getBadgeTier(b, stats);
+    if (t.maxed) return;
+    const remaining = Math.max(0, Math.ceil(t.nextTarget - t.val));
+    if (remaining <= 0) return;
+    if (!best || remaining < best.remaining) {
+      best = { badge: b, remaining, ...t };
+    }
+  });
+  return best;
+}
+
+function diaryPluralRu(n, one, few, many) {
+  const mod10 = n % 10, mod100 = n % 100;
+  if (mod10 === 1 && mod100 !== 11) return one;
+  if (mod10 >= 2 && mod10 <= 4 && (mod100 < 10 || mod100 >= 20)) return few;
+  return many;
+}
+
+const DIARY_LEVEL_NAMES = [
+  { min: 1,  name: "Новичок" },
+  { min: 3,  name: "Любитель" },
+  { min: 6,  name: "Опытный аквариумист" },
+  { min: 10, name: "Мастер" },
+  { min: 15, name: "Гуру" },
+];
+function diaryLevelName(level) {
+  let name = DIARY_LEVEL_NAMES[0].name;
+  for (const l of DIARY_LEVEL_NAMES) if (level >= l.min) name = l.name;
+  return name;
+}
+function diaryComputeXP(stats) {
+  return stats.totalLogs * 10 + stats.water * 5 + stats.clean * 5 + stats.tankCount * 15
+    + stats.totalFish * 2 + stats.bestStreak * 8
+    + stats.onTimeCare * 8      // бонус за уход ДО просрочки — поощряем своевременность, а не просто клики
+    + stats.monthsNoLoss * 20;  // бонус за здоровье коллекции — ни одной потери
+}
+
+function DiaryGamificationBar({ stats, onOpenBadges }) {
+  const xp = diaryComputeXP(stats);
+  const level = Math.floor(xp / 100) + 1;
+  const xpInLevel = xp % 100;
+  const levelName = diaryLevelName(level);
+  const earnedCount = DIARY_BADGES.filter(b => getBadgeTier(b, stats).earned).length;
+  return (
+    <div onClick={onOpenBadges} style={{ background: Dp.card, border: `1px solid ${Dp.border}`, borderRadius: 16, padding: 14, marginBottom: 12, cursor: "pointer" }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ width: 36, height: 36, borderRadius: 999, background: "linear-gradient(135deg,#00C9B1,#F0A93C)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 15, fontWeight: 900, color: "#08131F", flexShrink: 0 }}>
+            {level}
+          </div>
+          <div>
+            <div style={{ fontSize: 13, fontWeight: 800 }}>{levelName} <span style={{ color: Dp.muted, fontWeight: 600 }}>· уровень {level}</span></div>
+            <div style={{ fontSize: 11, color: Dp.muted }}>
+              🏅 {earnedCount} из {DIARY_BADGES.length} бейджей
+              {stats.currentStreak > 1 && <span style={{ color: Dp.amber }}> · 🔥 серия {stats.currentStreak} дн.</span>}
+            </div>
+          </div>
+        </div>
+        <span style={{ fontSize: 11, color: Dp.teal, fontWeight: 700, whiteSpace: "nowrap" }}>Все бейджи →</span>
+      </div>
+      <div style={{ height: 6, background: Dp.border, borderRadius: 999, overflow: "hidden" }}>
+        <div style={{ height: "100%", width: `${xpInLevel}%`, background: "linear-gradient(90deg,#00C9B1,#F0A93C)", borderRadius: 999, transition: "width 0.4s ease" }} />
+      </div>
+      <div style={{ fontSize: 10, color: Dp.muted, marginTop: 4 }}>{xpInLevel}/100 XP до уровня {level + 1} ({diaryLevelName(level + 1)})</div>
+    </div>
+  );
+}
+
+function DiaryBadgeStrip({ stats, onOpenBadges }) {
+  return (
+    <div onClick={onOpenBadges} style={{ display: "flex", gap: 8, overflowX: "auto", paddingBottom: 4, marginBottom: 16, cursor: "pointer" }}>
+      {DIARY_BADGES.map(b => {
+        const { earned, tierIndex } = getBadgeTier(b, stats);
+        const tierColor = earned ? TIER_COLORS[tierIndex] : Dp.border;
+        return (
+          <div key={b.id} title={b.title} style={{ position: "relative", flex: "0 0 auto", width: 50, height: 50, borderRadius: 14, background: earned ? "#0F2A26" : "#102433", border: `1px solid ${tierColor}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 21, opacity: earned ? 1 : 0.35, filter: earned ? "none" : "grayscale(1)" }}>
+            {b.icon}
+            {earned && (
+              <span style={{ position: "absolute", bottom: -4, right: -4, width: 14, height: 14, borderRadius: 999, background: tierColor, border: `1px solid ${Dp.bg}` }} />
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ---- Карточка «ближайшая цель» — всегда видна на главном экране дневника ---- */
+function DiaryNextBadgeCard({ stats, onOpenBadges }) {
+  const nb = diaryNearestNextBadge(stats);
+
+  // Все бейджи уже на максимальном тире — поздравляем вместо прогресса
+  if (!nb) {
+    return (
+      <div onClick={onOpenBadges} style={{ background: "linear-gradient(135deg,#0F2A26,#1A2F1A)", border: `1px solid ${TIER_COLORS[2]}66`, borderRadius: 16, padding: "14px 16px", marginBottom: 16, cursor: "pointer", display: "flex", alignItems: "center", gap: 12 }}>
+        <span style={{ fontSize: 26 }}>🏆</span>
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 800, color: TIER_COLORS[2] }}>Все бейджи получены на золото!</div>
+          <div style={{ fontSize: 11, color: Dp.muted }}>Вы — легенда AquaMarjon 🌟</div>
+        </div>
+      </div>
+    );
+  }
+
+  const { badge, tierIndex, pctToNext, remaining } = nb;
+  const nextTierIndex = tierIndex + 1;
+  const nextTierColor = TIER_COLORS[nextTierIndex];
+  const word = diaryPluralRu(remaining, "записи", "записей", "записей");
+
+  return (
+    <div
+      onClick={onOpenBadges}
+      style={{
+        background: Dp.card, border: `1px solid ${nextTierColor}66`, borderRadius: 16,
+        padding: "14px 16px", marginBottom: 16, cursor: "pointer", position: "relative", overflow: "hidden",
+      }}
+    >
+      <div style={{ position: "absolute", top: -20, right: -20, width: 90, height: 90, borderRadius: 999, background: `${nextTierColor}14`, pointerEvents: "none" }} />
+      <div style={{ display: "flex", alignItems: "center", gap: 12, position: "relative" }}>
+        <div style={{ width: 42, height: 42, borderRadius: 12, background: "#102433", border: `1px solid ${nextTierColor}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22, flexShrink: 0 }}>
+          {badge.icon}
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 11, color: nextTierColor, fontWeight: 800, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 1 }}>
+            🎯 Ближайшая цель
+          </div>
+          <div style={{ fontSize: 13, fontWeight: 700, color: Dp.text, marginBottom: 2 }}>
+            {badge.title} · {TIER_NAMES[nextTierIndex]}
+          </div>
+          <div style={{ fontSize: 11.5, color: Dp.soft }}>
+            Ещё <strong style={{ color: nextTierColor }}>{remaining}</strong> {word} до бейджа
+          </div>
+        </div>
+      </div>
+      <div style={{ height: 6, background: Dp.border, borderRadius: 999, overflow: "hidden", marginTop: 10 }}>
+        <div style={{ height: "100%", width: `${pctToNext * 100}%`, background: nextTierColor, borderRadius: 999, transition: "width 0.4s ease" }} />
+      </div>
+    </div>
+  );
+}
+
+/* ---- Конфетти при разблокировке бейджа ---- */
+function Confetti({ active, colors }) {
+  const pieces = useMemo(() => {
+    if (!active) return [];
+    const palette = colors && colors.length ? colors : ["#00C9B1", "#F0A93C", "#FFD24A", "#51CF66", "#FF6B6B", "#9FC4CC"];
+    return Array.from({ length: 26 }, (_, i) => ({
+      id: i,
+      left: 5 + Math.random() * 90,
+      delay: Math.random() * 0.25,
+      duration: 1.1 + Math.random() * 0.7,
+      size: 6 + Math.random() * 6,
+      color: palette[i % palette.length],
+      rotate: Math.round(Math.random() * 360),
+      drift: Math.round((Math.random() - 0.5) * 120),
+      round: Math.random() > 0.5,
+    }));
+  }, [active, colors]);
+
+  if (!active) return null;
+
+  return (
+    <>
+      <style>{`
+        @keyframes aquaConfettiFall {
+          0%   { transform: translate(0,0) rotate(0deg); opacity: 1; }
+          85%  { opacity: 1; }
+          100% { transform: translate(var(--drift), 160px) rotate(420deg); opacity: 0; }
+        }
+      `}</style>
+      <div style={{ position: "fixed", inset: 0, zIndex: 650, pointerEvents: "none", overflow: "hidden" }}>
+        {pieces.map(p => (
+          <span
+            key={p.id}
+            style={{
+              position: "absolute", top: "18%", left: `${p.left}%`,
+              width: p.size, height: p.size * (p.round ? 1 : 1.6),
+              background: p.color, borderRadius: p.round ? "50%" : 2,
+              ["--drift" as any]: `${p.drift}px`,
+              animation: `aquaConfettiFall ${p.duration}s ease-in ${p.delay}s forwards`,
+              transform: `rotate(${p.rotate}deg)`,
+            }}
+          />
+        ))}
+      </div>
+    </>
+  );
+}
+
+function DiaryAchievementsModal({ stats, onClose, onShare }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(5,10,16,0.85)", zIndex: 400, display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{ background: "#0B1B28", borderRadius: "20px 20px 0 0", padding: "22px 18px 32px", width: "100%", maxWidth: 460, maxHeight: "85vh", overflowY: "auto", color: Dp.text, boxSizing: "border-box" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div style={{ fontSize: 17, fontWeight: 900 }}>🏅 Достижения</div>
+          <button onClick={onClose} style={{ background: "none", border: "none", color: Dp.muted, fontSize: 20, cursor: "pointer", padding: 0 }}>✕</button>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+          {DIARY_BADGES.map(b => {
+            const { earned, tierIndex, maxed, val, nextTarget, pctToNext } = getBadgeTier(b, stats);
+            const tierColor = earned ? TIER_COLORS[tierIndex] : Dp.border;
+            return (
+              <div key={b.id} style={{ background: Dp.card, border: `1px solid ${tierColor}`, borderRadius: 14, padding: 12 }}>
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                  <div style={{ fontSize: 24, filter: earned ? "none" : "grayscale(0.6)" }}>{b.icon}</div>
+                  {earned && (
+                    <span style={{ fontSize: 9.5, fontWeight: 800, color: tierColor, border: `1px solid ${tierColor}66`, borderRadius: 999, padding: "1px 7px" }}>
+                      {TIER_NAMES[tierIndex]}
+                    </span>
+                  )}
+                </div>
+                <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 3 }}>{b.title}</div>
+                <div style={{ fontSize: 10.5, color: Dp.muted, marginBottom: 8, lineHeight: 1.4 }}>{b.desc}</div>
+                <div style={{ height: 5, background: Dp.border, borderRadius: 999, overflow: "hidden", marginBottom: 4 }}>
+                  <div style={{ height: "100%", width: `${pctToNext * 100}%`, background: earned ? "#51CF66" : Dp.amber, borderRadius: 999 }} />
+                </div>
+                <div style={{ fontSize: 10, color: earned ? "#51CF66" : Dp.muted, fontWeight: earned ? 700 : 400 }}>
+                  {maxed ? `✅ Золото (${val})` : `${val}/${nextTarget} до ${TIER_NAMES[tierIndex + 1]}`}
+                </div>
+                {earned && !maxed && (
+                  <div style={{ display: "flex", gap: 3, marginTop: 6, marginBottom: earned ? 8 : 0 }}>
+                    {TIER_NAMES.map((tn, i) => (
+                      <span key={tn} style={{ flex: 1, height: 3, borderRadius: 999, background: i <= tierIndex ? TIER_COLORS[i] : Dp.border }} />
+                    ))}
+                  </div>
+                )}
+                {earned && (() => {
+                  const code = diaryAchievementPromoCode(b.id, tierIndex);
+                  const percent = ACHIEVEMENT_PROMO_PERCENTS[tierIndex] ?? 5;
+                  return (
+                    <div
+                      onClick={(e) => { e.stopPropagation(); navigator.clipboard?.writeText(code); }}
+                      title="Скопировать промокод"
+                      style={{ marginTop: 8, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, background: "#08131F", border: `1px dashed ${tierColor}88`, borderRadius: 8, padding: "5px 8px", cursor: "pointer" }}
+                    >
+                      <span style={{ fontSize: 9.5, fontWeight: 800, color: Dp.amber, letterSpacing: 0.3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>🎁 {code}</span>
+                      <span style={{ fontSize: 9.5, color: Dp.muted, whiteSpace: "nowrap" }}>−{percent}%</span>
+                    </div>
+                  );
+                })()}
+                {earned && onShare && (
+                  <button
+                    onClick={() => onShare(b, tierIndex)}
+                    style={{ width: "100%", marginTop: 8, background: "#102433", border: `1px solid ${tierColor}66`, color: tierColor, borderRadius: 8, padding: "6px 0", fontSize: 11, fontWeight: 700, cursor: "pointer" }}
+                  >
+                    📤 Поделиться в Клубе
+                  </button>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Генерирует контент поста для шаринга бейджа в Клуб
+function diaryBadgeShareText(badge, tierIndex) {
+  return {
+    title: `Получил бейдж «${badge.title}» — ${TIER_NAMES[tierIndex]}! 🏅`,
+    text: `${badge.icon} ${badge.desc}. Веду дневник ухода в AquaMarjon — присоединяйтесь!`,
+    tag: { label: "Достижение", color: TIER_COLORS[tierIndex] },
+    photo: { emoji: badge.icon, color: TIER_COLORS[tierIndex] },
+  };
+}
+
+// Генерирует контент поста для шаринга «выживания» конкретной рыбы
+function diaryFishShareText(fish, tankName, days, tierIndex) {
+  return {
+    title: `${fish.img} ${fish.name} живёт у меня уже ${days} дней!`,
+    text: `Аквариум «${tankName}» · статус «${TIER_NAMES[tierIndex]}» в дневнике ухода AquaMarjon 🐠`,
+    tag: { label: "Питомец", color: TIER_COLORS[tierIndex] },
+    photo: { emoji: fish.img, color: TIER_COLORS[tierIndex] },
+  };
+}
+
+const FISH_SURVIVAL_TIERS = [30, 100, 365];
+function diaryDaysSince(iso) {
+  if (!iso) return 0;
+  const d = new Date(iso + "T00:00:00");
+  const today = new Date(diaryTodayISO() + "T00:00:00");
+  return Math.max(0, Math.round((today.getTime() - d.getTime()) / 86400000));
+}
+function getFishSurvivalTier(days) {
+  let idx = -1;
+  FISH_SURVIVAL_TIERS.forEach((t, i) => { if (days >= t) idx = i; });
+  return idx;
+}
+
+// Рейтинг сообщества — фиктивные пользователи + текущий пользователь (по реальному XP)
+const DIARY_LEADERBOARD_USERS = [
+  { id: "u1", name: "Aziz_Breeder",           avatar: "🧑‍🦱", city: "Ташкент",    xp: 940 },
+  { id: "u2", name: "Malika_T",               avatar: "👩",   city: "Самарканд",  xp: 780 },
+  { id: "u3", name: "PlantLover_Samarkand",   avatar: "🌿",   city: "Самарканд",  xp: 615 },
+  { id: "u4", name: "Rustam_Nukus",           avatar: "🐠",   city: "Нукус",      xp: 540 },
+  { id: "u5", name: "Тимур",                  avatar: "📍",   city: "Ташкент",    xp: 410 },
+  { id: "u6", name: "Dilnoza_Aqua",           avatar: "👩‍🦰", city: "Фергана",    xp: 295 },
+  { id: "u7", name: "Jasur_K",                avatar: "🧔",   city: "Андижан",    xp: 150 },
+];
+function diaryBuildLeaderboard(diaryStats) {
+  const myXp = diaryStats ? diaryComputeXP(diaryStats) : 0;
+  const myLevel = Math.floor(myXp / 100) + 1;
+  const rows = [
+    ...DIARY_LEADERBOARD_USERS.map(u => ({ ...u, level: Math.floor(u.xp / 100) + 1, isMe: false })),
+    { id: "me", name: "Вы", avatar: "🧑‍🚀", city: "—", xp: myXp, level: myLevel, isMe: true },
+  ];
+  rows.sort((a, b) => b.xp - a.xp);
+  return rows;
+}
 
 function diaryUrgency(daysAgo, interval) {
   const pct = daysAgo / interval;
@@ -6463,21 +7885,46 @@ function DPill({ text, color }) {
 }
 
 /* ---- Чек-лист "Задачи на сегодня" + параметры воды (как в карточке аквариума) ---- */
-function DiaryParamsGrid({ tank }) {
+function DiaryParamsGrid({ tank, onOpenCatalog }) {
   const params = [
     { label: "pH", value: tank.ph, color: Dp.teal },
     { label: "Темп.", value: `${tank.temperature}°C`, color: Dp.amber },
     { label: "NO₃", value: tank.no3 ?? "—", color: tank.no3 > 40 ? Dp.danger : Dp.soft },
     { label: "NH₄", value: (tank.nh4 ?? 0).toFixed(1), color: (tank.nh4 ?? 0) > 0 ? Dp.danger : "#51CF66" },
   ];
+  // Замыкаем цикл «дневник → магазин»: если показатели вышли за норму, сразу
+  // предлагаем конкретный товар, а не только в AI Докторе.
+  const no3High = tank.no3 != null && tank.no3 > 40;
+  const nh4High = (tank.nh4 ?? 0) > 0;
+  let alert = null;
+  if (nh4High) {
+    alert = { text: "Обнаружен аммиак (NH₄) — это опасно для рыб. Подмените 20–30% воды и используйте кондиционер для нейтрализации.", query: "кондиционер для воды антиаммиак" };
+  } else if (no3High) {
+    alert = { text: "NO₃ выше нормы (>40 мг/л) — пора подменить воду и проверить параметры тест-набором.", query: "тест набор для воды NO3" };
+  }
   return (
-    <div style={{ display: "flex", gap: 8, marginBottom: 14 }}>
-      {params.map((p, i) => (
-        <div key={i} style={{ flex: 1, background: Dp.card, border: `1px solid ${Dp.border}`, borderRadius: 12, padding: "9px 4px", textAlign: "center" }}>
-          <div style={{ fontSize: 15, fontWeight: 800, color: p.color }}>{p.value}</div>
-          <div style={{ fontSize: 10, color: Dp.muted, marginTop: 1 }}>{p.label}</div>
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ display: "flex", gap: 8 }}>
+        {params.map((p, i) => (
+          <div key={i} style={{ flex: 1, background: Dp.card, border: `1px solid ${Dp.border}`, borderRadius: 12, padding: "9px 4px", textAlign: "center" }}>
+            <div style={{ fontSize: 15, fontWeight: 800, color: p.color }}>{p.value}</div>
+            <div style={{ fontSize: 10, color: Dp.muted, marginTop: 1 }}>{p.label}</div>
+          </div>
+        ))}
+      </div>
+      {alert && (
+        <div style={{ marginTop: 8, background: "#2A1414", border: `1px solid ${Dp.danger}66`, borderRadius: 12, padding: "10px 12px" }}>
+          <div style={{ fontSize: 12, color: "#FF8A8A", lineHeight: 1.4, marginBottom: 8 }}>⚠️ {alert.text}</div>
+          {onOpenCatalog && (
+            <button
+              onClick={() => onOpenCatalog(alert.query)}
+              style={{ width: "100%", background: Dp.danger, border: "none", color: "#fff", borderRadius: 9, padding: "8px 0", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
+            >
+              🛒 Подобрать товар в каталоге
+            </button>
+          )}
         </div>
-      ))}
+      )}
     </div>
   );
 }
@@ -6564,7 +8011,7 @@ function DiaryTankCard({ tank, onClick }) {
         </div>
         <div>
           <div style={{ fontSize: 15, fontWeight: 700 }}>{tank.name}</div>
-          <div style={{ fontSize: 12, color: Dp.muted }}>{tank.volume} л · {tank.fish.length} вида · {tank.fish.reduce((s,f)=>s+f.qty,0)} рыб</div>
+          <div style={{ fontSize: 12, color: Dp.muted }}>{tank.volume} л · {tank.fish.filter(f=>f.status!=="lost").length} вида · {tank.fish.reduce((s,f)=>s+(f.status==="lost"?0:f.qty),0)} рыб</div>
         </div>
       </div>
       {tasksTotal > 0 && (
@@ -6582,16 +8029,46 @@ function DiaryTankCard({ tank, onClick }) {
   );
 }
 
-function DiaryTankDetail({ tank, onBack, onUpdate }) {
+function DiaryTankDetail({ tank, onBack, onUpdate, onShareFish, onOpenCatalog }) {
   const [tab, setTab] = useState("diary");
   const [addingLog, setAddingLog] = useState(false);
   const [logType, setLogType] = useState("water");
   const [logNote, setLogNote] = useState("");
   const [logTemp, setLogTemp] = useState(tank.temperature);
+  const [confirmLossId, setConfirmLossId] = useState(null);
+  const [addFishModal, setAddFishModal] = useState(false);
+
+  function addFishToTank(fish) {
+    onUpdate({
+      ...tank,
+      fish: [...tank.fish, {
+        id: fish.id + "_" + Date.now(), name: fish.name, qty: 1, img: fish.img,
+        temp: fish.temp, lifespan: fish.lifespan || "—",
+        addedDate: new Date().toLocaleDateString("ru-RU", { day: "numeric", month: "long" }),
+        addedDateISO: diaryTodayISO(), status: "alive",
+      }],
+    });
+    setAddFishModal(false);
+  }
+
+  function markFishLost(fishId) {
+    const today = diaryTodayISO();
+    onUpdate({
+      ...tank,
+      fish: tank.fish.map(f => f.id === fishId ? { ...f, status: "lost", lostDateISO: today } : f),
+      lastLossISO: today, // сбрасывает отсчёт «месяцев без потерь» для бейджа 🛡️
+    });
+    setConfirmLossId(null);
+  }
 
   function addLog() {
     if (!logNote.trim()) return;
-    const newLog = { id: "l" + Date.now(), date: "Сейчас", type: logType, note: logNote, temp: logTemp };
+    // Своевременность: задача выполнена ДО того, как стала просроченной (daysAgo < интервал)
+    const onTime =
+      logType === "water" ? tank.lastWaterChange < tank.waterChangeEvery :
+      logType === "clean" ? tank.lastFilterClean < tank.filterCleanEvery :
+      undefined;
+    const newLog = { id: "l" + Date.now(), date: diaryTodayISO(), type: logType, note: logNote, temp: logTemp, onTime };
     onUpdate({
       ...tank, logs: [newLog, ...tank.logs],
       lastWaterChange: logType === "water" ? 0 : tank.lastWaterChange,
@@ -6615,7 +8092,7 @@ function DiaryTankDetail({ tank, onBack, onUpdate }) {
           <span style={{ fontSize: 28 }}>{tank.emoji}</span>
           <div>
             <div style={{ fontSize: 17, fontWeight: 800 }}>{tank.name}</div>
-            <div style={{ fontSize: 12, color: Dp.muted }}>{tank.volume} л · {tank.fish.reduce((s,f)=>s+f.qty,0)} рыб · 🌡 {tank.temperature}°C</div>
+            <div style={{ fontSize: 12, color: Dp.muted }}>{tank.volume} л · {tank.fish.reduce((s,f)=>s+(f.status==="lost"?0:f.qty),0)} рыб · 🌡 {tank.temperature}°C</div>
           </div>
         </div>
       </div>
@@ -6633,7 +8110,7 @@ function DiaryTankDetail({ tank, onBack, onUpdate }) {
         {/* DIARY TAB */}
         {tab === "diary" && (
           <>
-            <DiaryParamsGrid tank={tank} />
+            <DiaryParamsGrid tank={tank} onOpenCatalog={onOpenCatalog} />
             <DiaryTaskList tank={tank} onUpdate={onUpdate} />
             <UrgencyBar daysAgo={tank.lastWaterChange} interval={tank.waterChangeEvery} label={`💧 Смена воды (каждые ${tank.waterChangeEvery} дн.)`} />
             <UrgencyBar daysAgo={tank.lastFilterClean} interval={tank.filterCleanEvery} label={`🧹 Чистка фильтра (каждые ${tank.filterCleanEvery} дн.)`} />
@@ -6648,6 +8125,16 @@ function DiaryTankDetail({ tank, onBack, onUpdate }) {
                     </button>
                   ))}
                 </div>
+                {(logType === "water" || logType === "clean") && (
+                  (() => {
+                    const onTimeNow = logType === "water" ? tank.lastWaterChange < tank.waterChangeEvery : tank.lastFilterClean < tank.filterCleanEvery;
+                    return (
+                      <div style={{ fontSize: 11, marginBottom: 10, color: onTimeNow ? "#51CF66" : Dp.amber, display: "flex", alignItems: "center", gap: 5 }}>
+                        {onTimeNow ? "✅ Вовремя — будет бонус +8 XP" : "⚠️ Уже просрочено — бонус за своевременность не начислится"}
+                      </div>
+                    );
+                  })()
+                )}
                 <textarea
                   value={logNote} onChange={e => setLogNote(e.target.value)}
                   placeholder="Что сделали или заметили?"
@@ -6679,8 +8166,15 @@ function DiaryTankDetail({ tank, onBack, onUpdate }) {
               return (
                 <div key={log.id} style={{ background: Dp.card, border: `1px solid ${Dp.border}`, borderRadius: 12, padding: "12px 14px", marginBottom: 10 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
-                    <span style={{ fontSize: 12, background: lt.color + "22", color: lt.color, border: `1px solid ${lt.color}44`, borderRadius: 999, padding: "2px 8px", fontWeight: 600 }}>{lt.icon} {lt.label}</span>
-                    <span style={{ fontSize: 11.5, color: Dp.muted }}>{log.date} · {log.temp}°C</span>
+                    <span style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                      <span style={{ fontSize: 12, background: lt.color + "22", color: lt.color, border: `1px solid ${lt.color}44`, borderRadius: 999, padding: "2px 8px", fontWeight: 600 }}>{lt.icon} {lt.label}</span>
+                      {log.onTime === true && (
+                        <span title="Сделано до просрочки — бонус XP" style={{ fontSize: 10.5, background: "#0F2A26", color: "#51CF66", border: "1px solid #51CF6666", borderRadius: 999, padding: "2px 7px", fontWeight: 700 }}>
+                          ✅ Вовремя +8 XP
+                        </span>
+                      )}
+                    </span>
+                    <span style={{ fontSize: 11.5, color: Dp.muted }}>{formatDiaryDate(log.date)} · {log.temp}°C</span>
                   </div>
                   <div style={{ fontSize: 13, color: Dp.text, lineHeight: 1.5 }}>{log.note}</div>
                 </div>
@@ -6692,26 +8186,81 @@ function DiaryTankDetail({ tank, onBack, onUpdate }) {
         {/* FISH TAB */}
         {tab === "fish" && (
           <>
-            {tank.fish.map(f => (
-              <div key={f.id} style={{ background: Dp.card, border: `1px solid ${Dp.border}`, borderRadius: 14, padding: "14px", marginBottom: 10 }}>
-                <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 8 }}>
-                  <span style={{ fontSize: 28 }}>{f.img}</span>
-                  <div>
-                    <div style={{ fontSize: 14, fontWeight: 700 }}>{f.name}</div>
-                    <div style={{ fontSize: 12, color: Dp.muted }}>{f.qty} шт · добавлены {f.addedDate}</div>
+            {tank.fish.map(f => {
+              const isLost = f.status === "lost";
+              const days = f.addedDateISO ? diaryDaysSince(f.addedDateISO) : null;
+              const tierIndex = days != null ? getFishSurvivalTier(days) : -1;
+              const earned = tierIndex >= 0;
+              const nextTarget = tierIndex < FISH_SURVIVAL_TIERS.length - 1 ? FISH_SURVIVAL_TIERS[tierIndex + 1] : FISH_SURVIVAL_TIERS[FISH_SURVIVAL_TIERS.length - 1];
+              const prevTarget = tierIndex >= 0 ? FISH_SURVIVAL_TIERS[tierIndex] : 0;
+              const pct = tierIndex === FISH_SURVIVAL_TIERS.length - 1 ? 1 : Math.min(Math.max((days - prevTarget) / ((nextTarget - prevTarget) || 1), 0), 1);
+              return (
+                <div key={f.id} style={{ background: Dp.card, border: `1px solid ${isLost ? Dp.border : earned ? TIER_COLORS[tierIndex] : Dp.border}`, borderRadius: 14, padding: "14px", marginBottom: 10, opacity: isLost ? 0.6 : 1 }}>
+                  <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 8 }}>
+                    <span style={{ fontSize: 28, filter: isLost ? "grayscale(1)" : "none" }}>{f.img}</span>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ fontSize: 14, fontWeight: 700, textDecoration: isLost ? "line-through" : "none" }}>{f.name}</div>
+                      <div style={{ fontSize: 12, color: Dp.muted }}>
+                        {isLost ? `🕊️ В памяти · с ${f.addedDate}${f.lostDateISO ? ` по ${formatDiaryDate(f.lostDateISO)}` : ""}` : `${f.qty} шт · добавлены ${f.addedDate}`}
+                      </div>
+                    </div>
+                    {!isLost && earned && (
+                      <span style={{ fontSize: 9.5, fontWeight: 800, color: TIER_COLORS[tierIndex], border: `1px solid ${TIER_COLORS[tierIndex]}66`, borderRadius: 999, padding: "1px 7px", whiteSpace: "nowrap" }}>
+                        {TIER_NAMES[tierIndex]}
+                      </span>
+                    )}
                   </div>
+                  {!isLost && (
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", fontSize: 12, color: Dp.soft, marginBottom: f.addedDateISO ? 10 : 0 }}>
+                      <span>🌡 {f.temp[0]}–{f.temp[1]}°C</span>
+                      <span>⏳ Живёт {f.lifespan}</span>
+                    </div>
+                  )}
+                  {!isLost && f.addedDateISO && (
+                    <>
+                      <div style={{ fontSize: 11, color: Dp.muted, marginBottom: 4 }}>
+                        📅 {days} дн. у вас {tierIndex === FISH_SURVIVAL_TIERS.length - 1 ? "— максимум!" : `· до «${TIER_NAMES[tierIndex + 1]}» осталось ${nextTarget - days} дн.`}
+                      </div>
+                      <div style={{ height: 5, background: Dp.border, borderRadius: 999, overflow: "hidden", marginBottom: earned ? 8 : 0 }}>
+                        <div style={{ height: "100%", width: `${pct * 100}%`, background: earned ? TIER_COLORS[tierIndex] : Dp.amber, borderRadius: 999 }} />
+                      </div>
+                      {earned && onShareFish && (
+                        <button
+                          onClick={() => onShareFish(f, tank.name, days, tierIndex)}
+                          style={{ width: "100%", background: "#102433", border: `1px solid ${TIER_COLORS[tierIndex]}66`, color: TIER_COLORS[tierIndex], borderRadius: 8, padding: "6px 0", fontSize: 11, fontWeight: 700, cursor: "pointer", marginBottom: 8 }}
+                        >
+                          📤 Поделиться в Клубе
+                        </button>
+                      )}
+                    </>
+                  )}
+                  {!isLost && (
+                    confirmLossId === f.id ? (
+                      <div style={{ display: "flex", gap: 8, alignItems: "center", background: "#2A1414", border: "1px solid #FF6B6B66", borderRadius: 8, padding: "8px 10px" }}>
+                        <span style={{ fontSize: 11, color: "#FF8A8A", flex: 1 }}>Отметить рыбу как потерянную? Это сбросит счётчик «без потерь» 🛡️</span>
+                        <button onClick={() => setConfirmLossId(null)} style={{ background: "none", border: `1px solid ${Dp.border}`, color: Dp.muted, borderRadius: 6, padding: "4px 8px", fontSize: 11, cursor: "pointer" }}>Отмена</button>
+                        <button onClick={() => markFishLost(f.id)} style={{ background: "#FF6B6B", border: "none", color: "#1A0808", borderRadius: 6, padding: "4px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>Да</button>
+                      </div>
+                    ) : (
+                      <button onClick={() => setConfirmLossId(f.id)} style={{ width: "100%", background: "none", border: `1px dashed ${Dp.border}`, color: Dp.muted, borderRadius: 8, padding: "5px 0", fontSize: 10.5, cursor: "pointer" }}>
+                        💔 Отметить как потерянную
+                      </button>
+                    )
+                  )}
                 </div>
-                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", fontSize: 12, color: Dp.soft }}>
-                  <span>🌡 {f.temp[0]}–{f.temp[1]}°C</span>
-                  <span>⏳ Живёт {f.lifespan}</span>
-                </div>
-              </div>
-            ))}
+              );
+            })}
             {tank.fish.length === 0 && (
-              <div style={{ textAlign: "center", color: Dp.muted, fontSize: 13, marginTop: 30 }}>
-                Рыб ещё нет — добавьте рыб в аквариум из каталога
+              <div style={{ textAlign: "center", color: Dp.muted, fontSize: 13, marginTop: 30, marginBottom: 14 }}>
+                Рыб ещё нет — добавьте рыб в аквариум
               </div>
             )}
+            <button
+              onClick={() => setAddFishModal(true)}
+              style={{ width: "100%", background: "#102433", border: `1px dashed ${Dp.border}`, color: Dp.soft, borderRadius: 12, padding: "12px 0", fontSize: 13, fontWeight: 600, cursor: "pointer" }}
+            >
+              🐠 + Добавить рыбу в этот аквариум
+            </button>
           </>
         )}
 
@@ -6733,6 +8282,61 @@ function DiaryTankDetail({ tank, onBack, onUpdate }) {
             ))}
           </div>
         )}
+      </div>
+      {addFishModal && (
+        <DiaryAddFishModal tank={tank} onClose={() => setAddFishModal(false)} onAdd={addFishToTank} />
+      )}
+    </div>
+  );
+}
+
+// Живая проверка совместимости при добавлении рыбы в УЖЕ существующий
+// аквариум дневника — переиспользует ту же checkCompatibility, что и корзина,
+// просто собирает «виртуальную корзину» из текущих обитателей по FISH_DB.
+function DiaryAddFishModal({ tank, onClose, onAdd }) {
+  const [q, setQ] = useState("");
+  const tankAsCart = tank.fish
+    .filter(f => f.status !== "lost")
+    .map(f => FISH_DB.find(d => f.id.startsWith(d.id)))
+    .filter(Boolean);
+  const results = FISH_DB.filter(f => f.type === "fish" && (!q || f.name.toLowerCase().includes(q.toLowerCase()))).slice(0, 30);
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(5,10,16,0.75)", zIndex: 300, display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{ background: "#0B1B28", borderRadius: "20px 20px 0 0", padding: "20px 16px 28px", width: "100%", maxWidth: 420, maxHeight: "78vh", display: "flex", flexDirection: "column", color: Dp.text }}>
+        <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 12 }}>Добавить рыбу в «{tank.name}»</div>
+        <input
+          autoFocus value={q} onChange={e => setQ(e.target.value)} placeholder="Поиск рыбы..."
+          style={{ width: "100%", background: "#102433", border: `1px solid ${Dp.border}`, borderRadius: 10, padding: "10px 12px", color: Dp.text, fontSize: 14, outline: "none", boxSizing: "border-box", marginBottom: 12 }}
+        />
+        <div style={{ overflowY: "auto", flex: 1 }}>
+          {results.map(f => {
+            const compat = checkCompatibility(f, tankAsCart);
+            const color = compat.level === "bad" ? Dp.danger : compat.level === "warn" ? Dp.amber : "#51CF66";
+            return (
+              <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 10, background: Dp.card, border: `1px solid ${Dp.border}`, borderRadius: 12, padding: "10px 12px", marginBottom: 8 }}>
+                <span style={{ fontSize: 24, width: 40, height: 40, borderRadius: 10, background: "#102433", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>{f.img}</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{f.name}</div>
+                  {compat.reason ? (
+                    <div style={{ fontSize: 11, color, marginTop: 2 }}>{compat.level === "bad" ? "⛔ " : "⚠️ "}{compat.reason}</div>
+                  ) : (
+                    <div style={{ fontSize: 11, color: "#51CF66", marginTop: 2 }}>✅ Совместима с обитателями</div>
+                  )}
+                </div>
+                <button
+                  onClick={() => onAdd(f)}
+                  style={{ background: compat.level === "bad" ? "transparent" : Dp.teal, border: `1px solid ${compat.level === "bad" ? Dp.danger : Dp.teal}`, color: compat.level === "bad" ? Dp.danger : "#08131F", borderRadius: 9, padding: "7px 10px", fontSize: 11.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}
+                >
+                  {compat.level === "bad" ? "Всё равно" : "+ Добавить"}
+                </button>
+              </div>
+            );
+          })}
+          {results.length === 0 && (
+            <div style={{ textAlign: "center", color: Dp.muted, fontSize: 13, marginTop: 20 }}>Ничего не найдено</div>
+          )}
+        </div>
+        <button onClick={onClose} style={{ marginTop: 12, width: "100%", background: "#102433", border: `1px solid ${Dp.border}`, color: Dp.soft, borderRadius: 12, padding: 12, fontSize: 14, cursor: "pointer" }}>Отмена</button>
       </div>
     </div>
   );
@@ -6773,10 +8377,135 @@ function DiaryAddTankModal({ onClose, onAdd }) {
   );
 }
 
-function DiaryScreen({ onBack }) {
-  const [tanks, setTanks] = useState(DIARY_SEED_TANKS);
+const DIARY_TANKS_STORAGE_KEY = "aqua_diary_tanks";
+const DIARY_LAST_OPEN_KEY = "aqua_diary_last_open";
+const DIARY_LAST_INACTIVITY_PUSH_KEY = "aqua_diary_last_inactivity_push";
+
+function daysSinceISO(iso: string | null): number | null {
+  if (!iso) return null;
+  return Math.floor((Date.now() - new Date(iso).getTime()) / 86400000);
+}
+
+// Удержание: если пользователь давно не открывал дневник, а у какого-то
+// аквариума просрочена смена воды/чистка фильтра — шлём пуш не чаще раза в
+// день (троттлим через локальную метку времени последней отправки).
+async function maybeSendInactivityReminder(tanks: any[]) {
+  const daysSinceOpen = daysSinceISO(readLocal(DIARY_LAST_OPEN_KEY, null));
+  if (daysSinceOpen == null || daysSinceOpen < 5) return; // порог — 5 дней без захода
+  const lastPush = readLocal(DIARY_LAST_INACTIVITY_PUSH_KEY, null);
+  if (lastPush && daysSinceISO(lastPush)! < 1) return; // не чаще раза в день
+
+  const overdueTank = (tanks || []).find(
+    (t) => t.lastWaterChange >= t.waterChangeEvery || t.lastFilterClean >= t.filterCleanEvery
+  );
+  if (!overdueTank) return;
+
+  const reason = overdueTank.lastWaterChange >= overdueTank.waterChangeEvery ? "смена воды" : "чистка фильтра";
+  const ok = await notifyTelegram("inactivity_reminder", {
+    text: `Вы не заходили ${daysSinceOpen} дн. — у «${overdueTank.name}» просрочена ${reason}`,
+    tankName: overdueTank.name, daysAgo: daysSinceOpen, reason,
+  });
+  if (ok) writeLocal(DIARY_LAST_INACTIVITY_PUSH_KEY, new Date().toISOString());
+}
+
+function DiaryScreen({ onBack, onAddClubPost, onStatsUpdate, onOpenCatalog }) {
+  const [tanks, setTanks] = useState(() => {
+    const pending = readLocal(PENDING_DIARY_TANK_KEY, null);
+    const saved = readLocal(DIARY_TANKS_STORAGE_KEY, null);
+    const base = saved || DIARY_SEED_TANKS;
+    return pending ? [pending, ...base] : base;
+  });
+  useEffect(() => { writeLocal(DIARY_TANKS_STORAGE_KEY, tanks); }, [tanks]);
+  // До открытия дневника шлём ретеншн-пуш по состоянию НА МОМЕНТ предыдущего
+  // визита, и только потом обновляем метку «открыл сейчас».
+  useEffect(() => {
+    maybeSendInactivityReminder(readLocal(DIARY_TANKS_STORAGE_KEY, DIARY_SEED_TANKS));
+    writeLocal(DIARY_LAST_OPEN_KEY, new Date().toISOString());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [selectedTank, setSelectedTank] = useState(null);
   const [addModal, setAddModal] = useState(false);
+  const [showBadges, setShowBadges] = useState(false);
+  const [badgeToast, setBadgeToast] = useState(null);
+  const [shareToast, setShareToast] = useState(false);
+  const prevEarnedRef = useRef(null);
+  const notifiedNearRef = useRef(new Set()); // чтобы не слать пуш повторно за один и тот же прогресс
+
+  // Если только что подхватили черновик из заказа — открываем его сразу и
+  // чистим за собой, чтобы он не подмешивался при следующем визите.
+  const [pendingTankToast, setPendingTankToast] = useState(null);
+  useEffect(() => {
+    const pending = readLocal(PENDING_DIARY_TANK_KEY, null);
+    if (pending) {
+      setSelectedTank(pending);
+      writeLocal(PENDING_DIARY_TANK_KEY, null);
+      setPendingTankToast({ text: `✅ Аквариум «${pending.name}» создан из заказа`, type: "ok" });
+      setTimeout(() => setPendingTankToast(null), 2200);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const stats = useMemo(() => computeDiaryStats(tanks), [tanks]);
+
+  // Поднимаем актуальную статистику наверх — нужна для рейтинга в Клубе
+  useEffect(() => { onStatsUpdate?.(stats); }, [stats]);
+
+  // Отслеживаем разблокировку новых бейджей/тиров и показываем тост
+  useEffect(() => {
+    const earnedKeys = diaryEarnedBadgeKeys(stats);
+    if (prevEarnedRef.current === null) {
+      // Первый расчёт при заходе в дневник: бейджи, уже полученные раньше,
+      // должны иметь рабочий промокод без показа тоста.
+      earnedKeys.forEach(k => {
+        const [badgeId, tierIndexStr] = k.split(":");
+        const badge = DIARY_BADGES.find(b => b.id === badgeId);
+        if (badge) unlockAchievementPromo(badge, Number(tierIndexStr));
+      });
+    } else {
+      const newOnes = earnedKeys.filter(k => !prevEarnedRef.current.includes(k));
+      if (newOnes.length > 0) {
+        const [badgeId, tierIndexStr] = newOnes[0].split(":");
+        const badge = DIARY_BADGES.find(b => b.id === badgeId);
+        if (badge) {
+          const tierIndex = Number(tierIndexStr);
+          const reward = unlockAchievementPromo(badge, tierIndex); // реальный промокод в магазин
+          setBadgeToast({ ...badge, tierIndex, rewardCode: reward.code, rewardPercent: reward.percent });
+          setTimeout(() => setBadgeToast(null), 5500);
+        }
+      }
+    }
+    prevEarnedRef.current = earnedKeys;
+  }, [stats]);
+
+  // Пуш в Telegram, когда пользователь близко к новому бейджу (актуально вне приложения)
+  useEffect(() => {
+    const nb = diaryNearestNextBadge(stats);
+    if (!nb || nb.remaining > 2) return;
+    const key = `${nb.badge.id}:${nb.tierIndex + 1}:${nb.remaining}`;
+    if (notifiedNearRef.current.has(key)) return;
+    notifiedNearRef.current.add(key);
+    const word = diaryPluralRu(nb.remaining, "записи", "записей", "записей");
+    notifyTelegram("badge_progress", {
+      title: `Ты на ${nb.remaining} ${word} от нового бейджа! 🎯`,
+      text: `${nb.badge.icon} «${nb.badge.title}» · ${TIER_NAMES[nb.tierIndex + 1]} уже близко — заполни дневник AquaMarjon`,
+      badgeId: nb.badge.id, tierIndex: nb.tierIndex + 1, remaining: nb.remaining,
+    });
+  }, [stats]);
+
+  function shareBadge(badge, tierIndex) {
+    if (!onAddClubPost) return;
+    onAddClubPost(diaryBadgeShareText(badge, tierIndex));
+    setBadgeToast(null);
+    setShareToast(true);
+    setTimeout(() => setShareToast(false), 2500);
+  }
+
+  function shareFish(fish, tankName, days, tierIndex) {
+    if (!onAddClubPost) return;
+    onAddClubPost(diaryFishShareText(fish, tankName, days, tierIndex));
+    setShareToast(true);
+    setTimeout(() => setShareToast(false), 2500);
+  }
 
   function updateTank(updated) {
     setTanks(prev => prev.map(t => t.id === updated.id ? updated : t));
@@ -6789,12 +8518,17 @@ function DiaryScreen({ onBack }) {
   }
 
   if (selectedTank) {
-    return <DiaryTankDetail tank={selectedTank} onBack={() => setSelectedTank(null)} onUpdate={updateTank} />;
+    return (
+      <>
+        <DiaryTankDetail tank={selectedTank} onBack={() => setSelectedTank(null)} onUpdate={updateTank} onShareFish={shareFish} onOpenCatalog={onOpenCatalog} />
+        <Toast toast={pendingTankToast} />
+      </>
+    );
   }
 
-  const totalLogs = tanks.reduce((s, t) => s + t.logs.length, 0);
-  const totalFish = tanks.reduce((s, t) => s + t.fish.reduce((ss, f) => ss + f.qty, 0), 0);
-  const waterChanges = tanks.reduce((s, t) => s + t.logs.filter(l => l.type === "water").length, 0);
+  const totalLogs = stats.totalLogs;
+  const totalFish = stats.totalFish;
+  const waterChanges = stats.water;
 
   return (
     <>
@@ -6825,6 +8559,11 @@ function DiaryScreen({ onBack }) {
             ))}
           </div>
 
+          {/* Геймификация: уровень, XP, бейджи */}
+          <DiaryGamificationBar stats={stats} onOpenBadges={() => setShowBadges(true)} />
+          <DiaryNextBadgeCard stats={stats} onOpenBadges={() => setShowBadges(true)} />
+          <DiaryBadgeStrip stats={stats} onOpenBadges={() => setShowBadges(true)} />
+
           {tanks.map(tank => (
             <DiaryTankCard key={tank.id} tank={tank} onClick={() => setSelectedTank(tank)} />
           ))}
@@ -6835,6 +8574,62 @@ function DiaryScreen({ onBack }) {
         </div>
       </div>
       {addModal && <DiaryAddTankModal onClose={() => setAddModal(false)} onAdd={addTank} />}
+      {showBadges && <DiaryAchievementsModal stats={stats} onClose={() => setShowBadges(false)} onShare={shareBadge} />}
+      <Confetti active={!!badgeToast} colors={badgeToast ? [TIER_COLORS[badgeToast.tierIndex] || Dp.teal, "#FFD24A", "#51CF66"] : undefined} />
+      {badgeToast && (
+        <>
+          <style>{`
+            @keyframes aquaBadgePulse {
+              0%   { transform: scale(1); }
+              30%  { transform: scale(1.28); }
+              55%  { transform: scale(0.95); }
+              75%  { transform: scale(1.1); }
+              100% { transform: scale(1); }
+            }
+            @keyframes aquaToastDrop {
+              0%   { transform: translate(-50%, -16px); opacity: 0; }
+              100% { transform: translate(-50%, 0); opacity: 1; }
+            }
+          `}</style>
+          <div style={{ position: "fixed", top: 20, left: "50%", transform: "translateX(-50%)", width: "calc(100% - 32px)", maxWidth: 380, background: "#0F2A26", border: `1px solid ${TIER_COLORS[badgeToast.tierIndex] || Dp.teal}`, borderRadius: 14, padding: "12px 16px", zIndex: 660, boxShadow: `0 8px 28px rgba(0,0,0,0.55), 0 0 0 3px ${TIER_COLORS[badgeToast.tierIndex] || Dp.teal}33`, animation: "aquaToastDrop 0.35s cubic-bezier(0.34,1.56,0.64,1)", boxSizing: "border-box" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontSize: 26, display: "inline-block", animation: "aquaBadgePulse 0.9s ease-in-out 0.1s" }}>{badgeToast.icon}</span>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 11.5, fontWeight: 800, color: TIER_COLORS[badgeToast.tierIndex] || Dp.teal, letterSpacing: 0.5, textTransform: "uppercase" }}>
+                  {TIER_NAMES[badgeToast.tierIndex]} · новый бейдж!
+                </div>
+                <div style={{ fontSize: 13.5, fontWeight: 700 }}>{badgeToast.title}</div>
+              </div>
+              {onAddClubPost && (
+                <button onClick={() => shareBadge(badgeToast, badgeToast.tierIndex)} style={{ background: TIER_COLORS[badgeToast.tierIndex] || Dp.teal, border: "none", color: "#08131F", borderRadius: 8, padding: "6px 10px", fontSize: 11, fontWeight: 800, cursor: "pointer", whiteSpace: "nowrap" }}>
+                  📤
+                </button>
+              )}
+            </div>
+            {badgeToast.rewardCode && (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10, background: "#08131F", border: `1px dashed ${Dp.amber}88`, borderRadius: 10, padding: "8px 10px" }}>
+                <span style={{ fontSize: 16 }}>🎁</span>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 10.5, color: Dp.muted }}>Промокод на скидку −{badgeToast.rewardPercent}% в магазине</div>
+                  <div style={{ fontSize: 13, fontWeight: 800, color: Dp.amber, letterSpacing: 0.5 }}>{badgeToast.rewardCode}</div>
+                </div>
+                <button
+                  onClick={() => { navigator.clipboard?.writeText(badgeToast.rewardCode); }}
+                  style={{ background: "#102433", border: `1px solid ${Dp.amber}66`, color: Dp.amber, borderRadius: 7, padding: "5px 9px", fontSize: 10.5, fontWeight: 700, cursor: "pointer", whiteSpace: "nowrap" }}
+                >
+                  Копировать
+                </button>
+              </div>
+            )}
+          </div>
+        </>
+      )}
+      {shareToast && (
+        <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "#0F2A26", border: `1px solid ${Dp.teal}`, color: Dp.text, padding: "10px 18px", borderRadius: 12, fontSize: 13, zIndex: 600, whiteSpace: "nowrap", boxShadow: "0 8px 24px rgba(0,0,0,0.5)" }}>
+          ✅ Опубликовано в Клубе
+        </div>
+      )}
+      <Toast toast={pendingTankToast} />
     </>
   );
 }
@@ -6846,6 +8641,7 @@ const CLUB_TABS = [
   { id: "forum",   label: "Форум",   icon: "💬" },
   { id: "exchange", label: "Обмен",  icon: "🔄" },
   { id: "contest", label: "Конкурс", icon: "🏆" },
+  { id: "rating",  label: "Рейтинг", icon: "📈" },
   { id: "cities",  label: "Города",  icon: "📍" },
 ];
 
@@ -6863,6 +8659,7 @@ const CLUB_POSTS = [
     title: "🏆 Конкурс «Лучший аквариум июня» — 500 000 UZS призовой фонд!",
     text: "Публикуйте фото своего аквариума с хэштегом #AquaMarjon_June. Голосование до 30 июня. Победитель получает сертификат на оборудование…",
     likes: 89, comments: 43, views: null, cta: "Участвовать",
+    photo: { emoji: "🪸", color: "#F0A93C" },
   },
   {
     id: "p3", tab: "exchange", author: "PlantLover_Samarkand", time: "3 часа назад", avatar: "🌿",
@@ -6891,6 +8688,7 @@ const CLUB_POSTS = [
     title: "Отдам мальков гуппи бесплатно — самовывоз, Нукус",
     text: "Развелось слишком много, отдаю по 10-15 штук в добрые руки. Пишите в личку, заберите быстро — а то некуда сажать новых.",
     likes: 9, comments: 4, views: 71,
+    photo: { emoji: "🐠", color: "#51CF66" },
   },
 ];
 
@@ -6908,7 +8706,17 @@ function ClubPostCard({ post }) {
         <DPill text={post.tag.label} color={post.tag.color} />
       </div>
       <div style={{ fontSize: 14.5, fontWeight: 800, marginBottom: 6, lineHeight: 1.35 }}>{post.title}</div>
-      <div style={{ fontSize: 13, color: Dp.soft, lineHeight: 1.55, marginBottom: 12 }}>{post.text}</div>
+      <div style={{ fontSize: 13, color: Dp.soft, lineHeight: 1.55, marginBottom: post.photo ? 10 : 12 }}>{post.text}</div>
+      {post.photo && (
+        <div style={{
+          width: "100%", aspectRatio: "16/9", borderRadius: 12, marginBottom: 12,
+          background: `linear-gradient(135deg, ${post.photo.color}33, #08131F)`,
+          border: `1px solid ${post.photo.color}44`,
+          display: "flex", alignItems: "center", justifyContent: "center", fontSize: 52,
+        }}>
+          {post.photo.emoji}
+        </div>
+      )}
       <div style={{ display: "flex", alignItems: "center", gap: 16, fontSize: 12, color: Dp.muted }}>
         <span>❤️ {post.likes}</span>
         <span>💬 {post.comments} ответов</span>
@@ -6923,11 +8731,137 @@ function ClubPostCard({ post }) {
   );
 }
 
-function ClubScreen({ onBack }) {
+function DiaryLeaderboard({ diaryStats }) {
+  const rows = diaryBuildLeaderboard(diaryStats);
+  const medals = ["🥇", "🥈", "🥉"];
+  return (
+    <div style={{ padding: "2px 0" }}>
+      {!diaryStats && (
+        <div style={{ fontSize: 12, color: Dp.muted, marginBottom: 12, textAlign: "center" }}>
+          Откройте 📔 Дневник и ведите записи — ваш результат появится здесь
+        </div>
+      )}
+      {rows.map((u, i) => (
+        <div key={u.id} style={{ display: "flex", alignItems: "center", gap: 10, background: u.isMe ? "#0F2A26" : Dp.card, border: `1px solid ${u.isMe ? Dp.teal : Dp.border}`, borderRadius: 14, padding: "10px 12px", marginBottom: 8 }}>
+          <div style={{ width: 26, textAlign: "center", fontSize: i < 3 ? 18 : 13, fontWeight: 800, color: i < 3 ? undefined : Dp.muted }}>
+            {i < 3 ? medals[i] : `#${i + 1}`}
+          </div>
+          <div style={{ width: 34, height: 34, borderRadius: 999, background: "#102433", border: `1px solid ${Dp.border}`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 16, flexShrink: 0 }}>
+            {u.avatar}
+          </div>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 13, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {u.name}{u.isMe && <span style={{ color: Dp.teal }}> (вы)</span>}
+            </div>
+            <div style={{ fontSize: 11, color: Dp.muted }}>{diaryLevelName(u.level)} · уровень {u.level}</div>
+          </div>
+          <div style={{ fontSize: 13, fontWeight: 800, color: Dp.amber, whiteSpace: "nowrap" }}>{u.xp} XP</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ReferralCard() {
+  const [code] = useState(() => getMyReferralCode());
+  const [friendCode, setFriendCode] = useState("");
+  const [msg, setMsg] = useState(null);
+  const shareText = `Заказываю рыб и оборудование в AquaMarjon — подключайся по моему коду ${code} и получи промокод на первый заказ! 🐠`;
+
+  function redeem() {
+    const res = redeemReferralCode(friendCode);
+    if (!res.ok) { setMsg({ ok: false, text: res.error }); return; }
+    setMsg({ ok: true, text: `Промокод −${res.reward.percent}% активирован: ${res.reward.code}` });
+    setFriendCode("");
+  }
+
+  return (
+    <div style={{ background: "linear-gradient(135deg, #0F2A26, #0E2030)", border: `1px solid ${Dp.teal}44`, borderRadius: 16, padding: 16, marginBottom: 14 }}>
+      <div style={{ fontSize: 14, fontWeight: 800, marginBottom: 4 }}>🤝 Пригласи друга — оба получите промокод</div>
+      <div style={{ fontSize: 12, color: Dp.soft, lineHeight: 1.5, marginBottom: 10 }}>
+        Поделитесь своим кодом. Когда друг активирует его — вы оба получаете скидку 10% на заказ от 150 000 сум.
+      </div>
+      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+        <div style={{ flex: 1, background: "#102433", border: `1px solid ${Dp.border}`, borderRadius: 10, padding: "9px 12px", fontSize: 14, fontWeight: 800, color: Dp.teal, letterSpacing: 0.5 }}>{code}</div>
+        <button
+          onClick={() => {
+            if (navigator.share) navigator.share({ text: shareText }).catch(() => {});
+            else navigator.clipboard?.writeText(shareText);
+          }}
+          style={{ background: Dp.teal, border: "none", color: "#08131F", borderRadius: 10, padding: "0 14px", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}
+        >
+          Поделиться
+        </button>
+      </div>
+      <div style={{ display: "flex", gap: 8 }}>
+        <input
+          value={friendCode} onChange={e => setFriendCode(e.target.value)} placeholder="Код друга (FRIEND-XXXXX)"
+          style={{ flex: 1, background: "#102433", border: `1px solid ${Dp.border}`, borderRadius: 10, padding: "9px 12px", color: Dp.text, fontSize: 13, outline: "none" }}
+        />
+        <button onClick={redeem} style={{ background: "#102433", border: `1px solid ${Dp.border}`, color: Dp.soft, borderRadius: 10, padding: "0 14px", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+          Активировать
+        </button>
+      </div>
+      {msg && (
+        <div style={{ marginTop: 8, fontSize: 12, color: msg.ok ? "#51CF66" : Dp.danger }}>{msg.ok ? "✅ " : "⚠️ "}{msg.text}</div>
+      )}
+    </div>
+  );
+}
+
+const POST_PHOTO_EMOJIS = ["🐠", "🐡", "🦈", "🪸", "🌿", "🏔️", "🌊", "👑"];
+
+function ClubComposeModal({ tab, onClose, onSubmit }) {
+  const [title, setTitle] = useState("");
+  const [text, setText] = useState("");
+  const [photoEmoji, setPhotoEmoji] = useState(null);
+  const tagInfo = (CLUB_TABS.find(t => t.id === tab) || {});
+
+  function submit() {
+    if (!title.trim()) return;
+    onSubmit({
+      title: title.trim(),
+      text: text.trim(),
+      tag: { label: tagInfo.label || "Пост", color: Dp.teal },
+      tab,
+      photo: photoEmoji ? { emoji: photoEmoji, color: Dp.teal } : undefined,
+    });
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(5,10,16,0.75)", zIndex: 300, display: "flex", alignItems: "flex-end", justifyContent: "center" }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{ background: "#0B1B28", borderRadius: "20px 20px 0 0", padding: "20px 16px 28px", width: "100%", maxWidth: 420, color: Dp.text }}>
+        <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 14 }}>Новый пост · {tagInfo.label}</div>
+        <input
+          autoFocus value={title} onChange={e => setTitle(e.target.value)} placeholder="Заголовок"
+          style={{ width: "100%", background: "#102433", border: `1px solid ${Dp.border}`, borderRadius: 10, padding: "11px 12px", color: Dp.text, fontSize: 14, outline: "none", boxSizing: "border-box", marginBottom: 10 }}
+        />
+        <textarea
+          value={text} onChange={e => setText(e.target.value)} placeholder="Расскажите подробнее..." rows={3}
+          style={{ width: "100%", background: "#102433", border: `1px solid ${Dp.border}`, borderRadius: 10, padding: "11px 12px", color: Dp.text, fontSize: 13.5, outline: "none", boxSizing: "border-box", marginBottom: 12, resize: "none", fontFamily: "inherit" }}
+        />
+        <div style={{ fontSize: 12, color: Dp.soft, marginBottom: 8 }}>📷 Фото аквариума/рыбы (визуал — важно!)</div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 18 }}>
+          {POST_PHOTO_EMOJIS.map(e => (
+            <button key={e} onClick={() => setPhotoEmoji(photoEmoji === e ? null : e)} style={{ width: 40, height: 40, borderRadius: 10, background: photoEmoji === e ? Dp.teal + "33" : "#102433", border: `1px solid ${photoEmoji === e ? Dp.teal : Dp.border}`, fontSize: 18, cursor: "pointer" }}>{e}</button>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={onClose} style={{ flex: 1, background: "#102433", border: `1px solid ${Dp.border}`, color: Dp.soft, borderRadius: 12, padding: 12, fontSize: 14, cursor: "pointer" }}>Отмена</button>
+          <button onClick={submit} disabled={!title.trim()} style={{ flex: 2, background: title.trim() ? Dp.teal : Dp.border, border: "none", color: title.trim() ? "#08131F" : Dp.muted, borderRadius: 12, padding: 12, fontSize: 14, fontWeight: 700, cursor: title.trim() ? "pointer" : "default" }}>Опубликовать</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ClubScreen({ onBack, posts, diaryStats, onAddPost }) {
   const [tab, setTab] = useState("forum");
   const [search, setSearch] = useState("");
+  const [composeOpen, setComposeOpen] = useState(false);
 
-  const filtered = CLUB_POSTS.filter(p => {
+  const allPosts = posts || CLUB_POSTS;
+  const filtered = allPosts.filter(p => {
     if (p.tab !== tab) return false;
     if (search.trim() && !(p.title + p.text).toLowerCase().includes(search.toLowerCase())) return false;
     return true;
@@ -6970,22 +8904,276 @@ function ClubScreen({ onBack }) {
       </div>
 
       <div style={{ padding: "16px 16px 0" }}>
-        {filtered.length > 0 ? (
+        {tab === "forum" && <ReferralCard />}
+        {tab === "rating" ? (
+          <DiaryLeaderboard diaryStats={diaryStats} />
+        ) : filtered.length > 0 ? (
           filtered.map(post => <ClubPostCard key={post.id} post={post} />)
         ) : (
           <div style={{ textAlign: "center", color: Dp.muted, fontSize: 13, marginTop: 30 }}>
             Пока нет постов в этой категории — будьте первым!
           </div>
         )}
-        <button style={{ width: "100%", border: `1px dashed ${Dp.border}`, background: "none", color: Dp.muted, borderRadius: 16, padding: 16, fontSize: 14, cursor: "pointer", marginBottom: 10 }}>
-          + Создать пост
-        </button>
+        {tab !== "rating" && (
+          <button onClick={() => setComposeOpen(true)} style={{ width: "100%", border: `1px dashed ${Dp.border}`, background: "none", color: Dp.muted, borderRadius: 16, padding: 16, fontSize: 14, cursor: "pointer", marginBottom: 10 }}>
+            + Создать пост
+          </button>
+        )}
       </div>
+      {composeOpen && (
+        <ClubComposeModal
+          tab={tab}
+          onClose={() => setComposeOpen(false)}
+          onSubmit={(payload) => { onAddPost && onAddPost(payload); setComposeOpen(false); }}
+        />
+      )}
     </div>
   );
 }
 
 /* ---- Компактная лендинг-шапка для главной страницы ---- */
+/* ============================================================
+   🏠 ГЛАВНАЯ СТРАНИЦА — поиск + избранное, баннеры, важные категории,
+   нижняя навигация: Главная · Каталог · Корзина · Профиль
+   ============================================================ */
+
+const HOME_BANNERS = [
+  {
+    title: "Скидка 15% на первый заказ",
+    sub: "Промокод действует на любых рыб и оборудование",
+    emoji: "🎉",
+    bg: "linear-gradient(135deg, #00C9B1, #00897B)",
+  },
+  {
+    title: "Привозные рыбы недели",
+    sub: "Редкие виды — ограниченная партия",
+    emoji: "✈️",
+    bg: "linear-gradient(135deg, #F0A93C, #C97A1A)",
+  },
+  {
+    title: "Бесплатная доставка от 200 000 сум",
+    sub: "Сегодня же, с гарантией 48 часов",
+    emoji: "🚚",
+    bg: "linear-gradient(135deg, #4D7CFE, #2F4FCB)",
+  },
+];
+
+const HOME_CATEGORIES = [
+  { icon: "🐠", label: "Гуппи", search: "Гуппи" },
+  { icon: "🗡️", label: "Меченосцы", search: "Меченосц" },
+  { icon: "👑", label: "Петушки", search: "Петушок" },
+  { icon: "💎", label: "Дискусы", search: "Дискус" },
+  { icon: "⛵", label: "Скалярии", search: "Скаляр" },
+  { icon: "✈️", label: "Привозные", cat: "import" },
+  { icon: "🧒", label: "Для детей", cat: "kids" },
+  { icon: "🦈", label: "Хищники", cat: "aggressive" },
+];
+
+function HomeScreen({
+  region, cart, setCart, wishlist, onToggleWishlist, subscriptions, onSubscribe,
+  onOpenCatalog, onOpenCart, onOpenProfile, onOpenFavorites, onOpenDoctor, onOpenConfigurator,
+  onOrderPlaced, quizFilter, onClearQuizFilter, onOpenDiary,
+}) {
+  const [bannerIdx, setBannerIdx] = useState(0);
+  const [filterSeed, setFilterSeed] = useState(null);
+
+  function handleCategorySelect(c) {
+    setFilterSeed({ token: Date.now(), search: c.search || "", cat: c.cat || "all" });
+  }
+
+  return (
+    <div style={{ minHeight: "100vh", background: "#08131F", color: "#E8F4F8", fontFamily: "system-ui, -apple-system, sans-serif", paddingBottom: 90 }}>
+      {/* Шапка */}
+      <div style={{ padding: "16px 16px 0" }}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 20 }}>🐠</span>
+            <span style={{ fontSize: 17, fontWeight: 900, letterSpacing: "-0.03em", color: "#00C9B1" }}>AquaMarjon</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            {region && (
+              <span style={{ fontSize: 12, color: "#6C8E96" }}>📍 {region}</span>
+            )}
+            <button
+              onClick={onOpenProfile}
+              style={{
+                width: 34, height: 34, borderRadius: "50%", flexShrink: 0,
+                background: "#102433", border: "1px solid #1C3A4A",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: 16, color: "#E8F4F8", cursor: "pointer",
+              }}
+            >
+              👤
+            </button>
+          </div>
+        </div>
+
+        {/* Поиск + избранное */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button
+            onClick={onOpenCatalog}
+            style={{
+              flex: 1, display: "flex", alignItems: "center", gap: 8,
+              background: "#102433", border: "1px solid #1C3A4A", borderRadius: 14,
+              padding: "12px 14px", cursor: "pointer", textAlign: "left",
+            }}
+          >
+            <span style={{ fontSize: 16, color: "#6C8E96" }}>🔍</span>
+            <span style={{ fontSize: 14, color: "#6C8E96" }}>Поиск рыб и товаров</span>
+          </button>
+          <button
+            onClick={onOpenFavorites}
+            style={{
+              position: "relative", flexShrink: 0,
+              width: 44, height: 44, borderRadius: 14,
+              background: "#102433", border: "1px solid #1C3A4A",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              fontSize: 18, cursor: "pointer", color: "#E8F4F8",
+            }}
+          >
+            ❤️
+            {wishlist && wishlist.length > 0 && (
+              <span style={{ position: "absolute", top: -5, right: -5, background: "#00C9B1", color: "#08131F", fontSize: 9, fontWeight: 800, borderRadius: 999, padding: "1px 5px", minWidth: 14, textAlign: "center" }}>
+                {wishlist.length}
+              </span>
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* Баннеры — горизонтальная карусель */}
+      <div
+        style={{ display: "flex", gap: 12, overflowX: "auto", padding: "16px 16px", scrollSnapType: "x mandatory" }}
+        onScroll={(e) => {
+          const w = e.currentTarget.clientWidth;
+          const idx = Math.round(e.currentTarget.scrollLeft / (w * 0.86 + 12));
+          if (idx !== bannerIdx) setBannerIdx(idx);
+        }}
+      >
+        {HOME_BANNERS.map((b, i) => (
+          <button
+            key={i}
+            onClick={onOpenCatalog}
+            style={{
+              flex: "0 0 86%", scrollSnapAlign: "start",
+              background: b.bg, border: "none", borderRadius: 18,
+              padding: "20px 18px", textAlign: "left", cursor: "pointer",
+              minHeight: 110, display: "flex", flexDirection: "column", justifyContent: "space-between",
+              boxShadow: "0 8px 24px rgba(0,0,0,0.35)",
+            }}
+          >
+            <span style={{ fontSize: 28 }}>{b.emoji}</span>
+            <div>
+              <div style={{ fontSize: 16, fontWeight: 900, color: "#08131F", marginBottom: 2, lineHeight: 1.25 }}>{b.title}</div>
+              <div style={{ fontSize: 12, fontWeight: 600, color: "#08131F", opacity: 0.8 }}>{b.sub}</div>
+            </div>
+          </button>
+        ))}
+      </div>
+
+      {/* Индикаторы баннеров */}
+      <div style={{ display: "flex", gap: 5, justifyContent: "center", marginBottom: 22 }}>
+        {HOME_BANNERS.map((_, i) => (
+          <span key={i} style={{ width: i === bannerIdx ? 16 : 6, height: 6, borderRadius: 999, background: i === bannerIdx ? "#00C9B1" : "#1C3A4A", transition: "all 0.2s" }} />
+        ))}
+      </div>
+
+      {/* Важные категории */}
+      <div style={{ padding: "0 16px" }}>
+        <h2 style={{ fontSize: 15, fontWeight: 800, margin: "0 0 12px", letterSpacing: "-0.01em" }}>Популярные категории</h2>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
+          {HOME_CATEGORIES.map((c) => {
+            const isActive = filterSeed && (
+              (c.search && filterSeed.search === c.search) ||
+              (c.cat && !c.search && filterSeed.cat === c.cat)
+            );
+            return (
+              <button
+                key={c.label}
+                onClick={() => handleCategorySelect(c)}
+                style={{
+                  display: "flex", flexDirection: "column", alignItems: "center", gap: 6,
+                  background: isActive ? "#0F2A26" : "#102433",
+                  border: `1px solid ${isActive ? "#00C9B1" : "#1C3A4A"}`,
+                  borderRadius: 14,
+                  padding: "14px 6px", cursor: "pointer",
+                }}
+              >
+                <span style={{ fontSize: 24 }}>{c.icon}</span>
+                <span style={{ fontSize: 11, fontWeight: 600, color: isActive ? "#00C9B1" : "#E8F4F8", textAlign: "center", lineHeight: 1.2 }}>{c.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Каталог рыб — встроен прямо на главной, под категориями.
+          Выбор категории выше фильтрует список ниже на месте, без перехода на отдельный экран. */}
+      <div style={{ marginTop: 20 }}>
+        <h2 style={{ fontSize: 15, fontWeight: 800, margin: "0 0 4px", padding: "0 16px", letterSpacing: "-0.01em" }}>Каталог рыб</h2>
+        <Catalog
+          region={region}
+          cart={cart}
+          setCart={setCart}
+          onOpenConfigurator={onOpenConfigurator}
+          onOpenProfile={onOpenProfile}
+          onOpenDoctor={onOpenDoctor}
+          onOrderPlaced={onOrderPlaced}
+          hideHeader
+          hideBottomNav
+          quizFilter={quizFilter}
+          onClearQuizFilter={onClearQuizFilter}
+          wishlist={wishlist}
+          onToggleWishlist={onToggleWishlist}
+          subscriptions={subscriptions}
+          onSubscribe={onSubscribe}
+          filterSeed={filterSeed}
+          onOpenDiary={onOpenDiary}
+        />
+      </div>
+
+      {/* Нижняя навигация: Главная · Каталог · Доктор · AI Подбор · Я — как в каталоге, чтобы не «прыгала» */}
+      <div
+        style={{
+          position: "fixed", bottom: 0, left: 0, right: 0,
+          background: "#0B1B28", borderTop: "1px solid #1C3A4A",
+          display: "flex", justifyContent: "space-around",
+          padding: "10px 0 14px", zIndex: 90,
+        }}
+      >
+        {[
+          ["🏠", "Главная", null, true],
+          ["🐠", "Каталог", onOpenCatalog, false],
+          ["🩺", "Доктор", onOpenDoctor, false],
+          ["🤖", "AI Подбор", onOpenConfigurator, false],
+        ].map(([icon, label, action, active]) => (
+          <button
+            key={label}
+            onClick={action || undefined}
+            style={{
+              position: "relative", textAlign: "center",
+              color: active ? "#00C9B1" : "#6C8E96",
+              fontSize: 11, fontWeight: active ? 700 : 500,
+              background: "none", border: "none",
+              cursor: action ? "pointer" : "default",
+            }}
+          >
+            <div style={{ fontSize: 18 }}>
+              {icon}
+              {label === "Каталог" && cart && cart.length > 0 && (
+                <span style={{ position: "absolute", top: -4, right: -6, background: "#00C9B1", color: "#08131F", fontSize: 9, fontWeight: 800, borderRadius: 999, padding: "1px 5px" }}>
+                  {cart.length}
+                </span>
+              )}
+            </div>
+            {label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function HomeHero({ region, onChangeRegion, onOpenProfile, onOpenDoctor, onOpenDiary, onOpenSeller, onOpenCourier, onOpenClub, cart, onOpenCart }) {
   return (
     <div style={{ position: "relative", overflow: "hidden", background: "radial-gradient(ellipse 100% 80% at 50% 0%, #0E2A36 0%, #08131F 80%)", paddingBottom: 0 }}>
@@ -7630,7 +9818,13 @@ function LoginScreen({ role, onBack, onLogin, accounts, onNoAccess }) {
       setToken(data.token);
       onLogin(data.user, data.needPasswordChange);
     } catch {
-      // Fallback к локальной проверке при недоступном бэкенде
+      if (!ALLOW_OFFLINE_AUTH_FALLBACK) {
+        setError("Сервер недоступен. Попробуйте позже.");
+        setLoading(false);
+        return;
+      }
+      // Fallback к локальной проверке при недоступном бэкенде (только для демо —
+      // см. предупреждение у ALLOW_OFFLINE_AUTH_FALLBACK выше)
       const acc = (accounts as any[]).find((a: any) =>
         a.role === role &&
         a.login === login.trim().toLowerCase() &&
@@ -8735,10 +10929,106 @@ function AdminPanel({ onBack }) {
 }
 
 /* ---------- App ---------- */
+
+// Безопасное чтение/запись localStorage — приложение продолжает работать офлайн,
+// так как весь каталог статичен и не требует сети для просмотра
+function readLocal(key, fallback) {
+  try { const raw = localStorage.getItem(key); return raw ? JSON.parse(raw) : fallback; }
+  catch { return fallback; }
+}
+function writeLocal(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
+}
+
+// Подписка на корм — скидка и расчёт следующей даты доставки
+const SUBSCRIPTION_DISCOUNT = 0.1; // 10%
+const SUBSCRIPTION_INTERVALS = [
+  { weeks: 2, label: "Каждые 2 недели" },
+  { weeks: 4, label: "Каждый месяц" },
+  { weeks: 6, label: "Раз в 6 недель" },
+];
+function nextDeliveryDate(intervalWeeks) {
+  return Date.now() + intervalWeeks * 7 * 24 * 60 * 60 * 1000;
+}
+function fmtDate(ts) {
+  return new Date(ts).toLocaleDateString("ru-RU", { day: "numeric", month: "long" });
+}
+
+function OfflineBanner() {
+  const [online, setOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
+  useEffect(() => {
+    const goOnline = () => setOnline(true);
+    const goOffline = () => setOnline(false);
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => { window.removeEventListener("online", goOnline); window.removeEventListener("offline", goOffline); };
+  }, []);
+  if (online) return null;
+  return (
+    <div style={{
+      position: "fixed", top: 0, left: 0, right: 0, zIndex: 999,
+      background: "#F0A93C", color: "#08131F", textAlign: "center",
+      fontSize: 12, fontWeight: 700, padding: "6px 10px",
+    }}>
+      📡 Нет соединения — каталог, корзина и избранное доступны офлайн. Оформление заказа и AI-функции требуют интернет.
+    </div>
+  );
+}
+
 export default function App() {
   const [screen, setScreen] = useState("landing"); // landing | quiz | city | catalog | seller | profile | delivery | courier | doctor | diary | admin
   const [region, setRegion] = useState(null);
-  const [cart, setCart] = useState([]);
+  const [cart, setCart] = useState(() => readLocal("aqua_cart", []));
+
+  // Избранное — отдельно от корзины, переживает перезагрузку и работает офлайн
+  const [wishlist, setWishlist] = useState(() => readLocal("aqua_wishlist", []));
+  useEffect(() => { writeLocal("aqua_wishlist", wishlist); }, [wishlist]);
+  useEffect(() => { writeLocal("aqua_cart", cart); }, [cart]);
+  function toggleWishlist(fish) {
+    setWishlist((w) => (w.some((x) => x.id === fish.id) ? w.filter((x) => x.id !== fish.id) : [...w, fish]));
+  }
+
+  // Подписка на корм/расходники — повторяющиеся заказы со скидкой
+  const [subscriptions, setSubscriptions] = useState(() => readLocal("aqua_subscriptions", []));
+  useEffect(() => { writeLocal("aqua_subscriptions", subscriptions); }, [subscriptions]);
+
+  function subscribeToProduct(product, intervalWeeks) {
+    setSubscriptions((subs) => {
+      const exists = subs.find((s) => s.productId === product.id);
+      const next = nextDeliveryDate(intervalWeeks);
+      if (exists) {
+        return subs.map((s) => s.productId === product.id
+          ? { ...s, intervalWeeks, nextDate: next, paused: false }
+          : s);
+      }
+      return [...subs, {
+        id: "sub_" + Date.now(),
+        productId: product.id,
+        product,
+        intervalWeeks,
+        nextDate: next,
+        createdAt: Date.now(),
+        paused: false,
+      }];
+    });
+  }
+  function cancelSubscription(subId) {
+    setSubscriptions((subs) => subs.filter((s) => s.id !== subId));
+  }
+  function toggleSubscriptionPause(subId) {
+    setSubscriptions((subs) => subs.map((s) => s.id === subId ? { ...s, paused: !s.paused } : s));
+  }
+
+  // Настройки push-уведомлений (Telegram Bot API)
+  const [notifPrefs, setNotifPrefs] = useState(() => readLocal("aqua_notif_prefs", DEFAULT_NOTIF_PREFS));
+  useEffect(() => { writeLocal("aqua_notif_prefs", notifPrefs); }, [notifPrefs]);
+  function updateNotifPref(key, value) {
+    setNotifPrefs((p) => {
+      const next = { ...p, [key]: value };
+      syncNotifPrefs(next);
+      return next;
+    });
+  }
 
   // Telegram Mini App — инициализация
   useEffect(() => {
@@ -8757,10 +11047,80 @@ export default function App() {
   const [noAccessRole, setNoAccessRole] = useState<string|null>(null); // экран «нет доступа»
   const [configuratorOpen, setConfiguratorOpen] = useState(false);
   const [cartOpen, setCartOpen] = useState(false);
-  const [orders, setOrders] = useState([]);
+  // Заказы пользователя и их статусы — храним в localStorage, иначе
+  // «Повторить заказ»/трекинг статуса доставки слетают при перезагрузке
+  // страницы (бэкенд для пользовательских заказов сейчас не опрашивается).
+  const [orders, setOrders] = useState(() => readLocal("aqua_orders", []));
+  useEffect(() => { writeLocal("aqua_orders", orders); }, [orders]);
   const [userTanks, setUserTanks] = useState([]);
   const [trackingOrder, setTrackingOrder] = useState(null);
   const [quizFilter, setQuizFilter] = useState(null); // фильтр из квиза
+  const [clubPosts, setClubPosts] = useState(CLUB_POSTS); // лента Клуба (включая шаринг бейджей)
+  const [diaryStats, setDiaryStats] = useState(null); // статистика дневника для рейтинга
+  const [catalogSearchSeed, setCatalogSearchSeed] = useState(null); // поиск, переданный из дневника/доктора в каталог
+  const [catalogCategorySeed, setCatalogCategorySeed] = useState(null); // категория, выбранная на главной
+  const [profileInitialTab, setProfileInitialTab] = useState(null); // вкладка профиля при открытии (напр. избранное)
+  const [flashToast, setFlashToast] = useState<{ text: string; type?: string } | null>(null); // одноразовый тост для каталога (напр. после «Повторить заказ»)
+
+  function addClubPost(payload) {
+    setClubPosts(prev => [
+      { id: "p_" + Date.now(), tab: "forum", author: "Вы", time: "только что", avatar: "🧑‍🚀", likes: 0, comments: 0, views: 0, ...payload },
+      ...prev,
+    ]);
+  }
+
+  // Повтор заказа из профиля: добавляем товары заказа в текущую корзину,
+  // но прогоняем рыб через ту же проверку совместимости, что и обычное
+  // добавление в каталоге — иначе можно молча получить несовместимых
+  // соседей по аквариуму в один клик.
+  function handleRepeatOrder(order) {
+    const items = Array.isArray(order?.items) ? order.items : [];
+    if (items.length === 0) return;
+
+    const added: any[] = [];
+    const skipped: any[] = [];
+    setCart((c) => {
+      const next = [...c];
+      for (const raw of items) {
+        const item = { ...raw };
+        if (item.type === "fish") {
+          const compat = checkCompatibility(item, next);
+          if (compat.level === "bad") {
+            skipped.push(item);
+            continue;
+          }
+        }
+        next.push(item);
+        added.push(item);
+      }
+      return next;
+    });
+
+    setScreen("catalog");
+    setCartOpen(true);
+
+    if (skipped.length > 0) {
+      const names = skipped.map((f) => f.name.split(" ")[0]).join(", ");
+      setFlashToast({
+        text: added.length > 0
+          ? `⚠️ Добавлено ${added.length} из ${items.length}. Пропущено: ${names} — несовместимы`
+          : `⚠️ Ничего не добавлено — ${names} несовместимы с корзиной`,
+        type: "bad",
+      });
+    } else {
+      setFlashToast({ text: `✅ Заказ добавлен в корзину (${added.length})`, type: "ok" });
+    }
+  }
+
+  // «Завести аквариум» из заказа: берём рыб из состава заказа и передаём
+  // черновик в дневник через тот же механизм PENDING_DIARY_TANK_KEY, что
+  // используется при создании дневника сразу после оформления заказа.
+  function handleCreateTankFromOrder(order) {
+    const fishItems = (Array.isArray(order?.items) ? order.items : []).filter((it) => it.type === "fish");
+    if (fishItems.length === 0) return;
+    writeLocal(PENDING_DIARY_TANK_KEY, buildTankDraftFromCart(fishItems));
+    setScreen("diary");
+  }
 
   if (screen === "landing") return <Landing onEnter={() => setScreen("quiz")} />;
 
@@ -8779,13 +11139,51 @@ export default function App() {
       <CityPicker
         onSelect={(r) => {
           setRegion(r);
-          setScreen("catalog");
+          setScreen("home");
         }}
       />
     );
-  if (screen === "doctor") return <FishDoctorScreen onBack={() => setScreen("catalog")} />;
-  if (screen === "diary")  return <DiaryScreen onBack={() => setScreen("catalog")} />;
-  if (screen === "club")   return <ClubScreen onBack={() => setScreen("catalog")} />;
+
+  if (screen === "home")
+    return (
+      <>
+      <HomeScreen
+        region={region}
+        cart={cart}
+        setCart={setCart}
+        wishlist={wishlist}
+        onToggleWishlist={toggleWishlist}
+        subscriptions={subscriptions}
+        onSubscribe={subscribeToProduct}
+        onOpenCatalog={() => setScreen("catalog")}
+        onOpenCart={() => { setScreen("catalog"); setCartOpen(true); }}
+        onOpenProfile={() => { setProfileInitialTab(null); setScreen("profile"); }}
+        onOpenFavorites={() => { setProfileInitialTab("favorites"); setScreen("profile"); }}
+        onOpenDoctor={() => setScreen("doctor")}
+        onOpenConfigurator={() => setConfiguratorOpen(true)}
+        onOrderPlaced={(order) => setOrders((o) => [...o, order])}
+        quizFilter={quizFilter}
+        onClearQuizFilter={() => setQuizFilter(null)}
+        onOpenDiary={() => setScreen("diary")}
+      />
+      {configuratorOpen && (
+        <AiConfigurator
+          onClose={() => setConfiguratorOpen(false)}
+          onApply={(fishList) => {
+            const expanded = fishList.flatMap((f) =>
+              Array.from({ length: f.qty || 1 }, () => f)
+            );
+            setCart((c) => [...c, ...expanded]);
+            setConfiguratorOpen(false);
+          }}
+        />
+      )}
+      </>
+    );
+
+  if (screen === "doctor") return <FishDoctorScreen onBack={() => setScreen("catalog")} cart={cart} setCart={setCart} />;
+  if (screen === "diary")  return <DiaryScreen onBack={() => setScreen("catalog")} onAddClubPost={addClubPost} onStatsUpdate={setDiaryStats} onOpenCatalog={(query) => { setCatalogSearchSeed(query); setScreen("catalog"); }} />;
+  if (screen === "club")   return <ClubScreen onBack={() => setScreen("catalog")} posts={clubPosts} diaryStats={diaryStats} onAddPost={addClubPost} />;
   if (screen === "seller") {
     if (noAccessRole === "seller") {
       return <ContactSupportScreen role="seller" onBack={() => setNoAccessRole(null)} />;
@@ -8859,14 +11257,19 @@ export default function App() {
           const updated = { ...trackingOrder, status };
           setTrackingOrder(updated);
           setOrders((prev) => prev.map((o) => o.id === updated.id ? updated : o));
+          if (notifPrefs.delivery) {
+            const info = ORDER_STATUSES.find((s) => s.key === status);
+            notifyTelegram("order_status", { orderId: updated.id, status, label: info?.label, desc: info?.desc });
+          }
         }}
       />
     );
   if (screen === "profile")
     return (
       <Profile
-        onBack={() => setScreen("catalog")}
+        onBack={() => setScreen("home")}
         onOpenCatalog={() => setScreen("catalog")}
+        initialTab={profileInitialTab}
         orders={orders}
         userTanks={userTanks}
         setUserTanks={setUserTanks}
@@ -8874,18 +11277,29 @@ export default function App() {
           setTrackingOrder(order);
           setScreen("delivery");
         }}
+        onRepeatOrder={handleRepeatOrder}
+        onCreateTankFromOrder={handleCreateTankFromOrder}
         onOpenDoctor={() => setScreen("doctor")}
         onOpenDiary={() => setScreen("diary")}
         onOpenSeller={() => setScreen("seller")}
         onOpenCourier={() => setScreen("courier")}
         onOpenClub={() => setScreen("club")}
         onOpenAdmin={() => setScreen("admin")}
+        wishlist={wishlist}
+        onToggleWishlist={toggleWishlist}
+        onAddToCart={(f) => setCart((c) => [...c, f])}
+        subscriptions={subscriptions}
+        onCancelSubscription={cancelSubscription}
+        onTogglePauseSubscription={toggleSubscriptionPause}
+        notifPrefs={notifPrefs}
+        onUpdateNotifPref={updateNotifPref}
       />
     );
 
   // Главная страница: лендинг-шапка + каталог
   return (
     <>
+      <OfflineBanner />
       {/* Компактный лендинг-хедер */}
       <HomeHero
         region={region}
@@ -8909,12 +11323,24 @@ export default function App() {
         onOpenConfigurator={() => setConfiguratorOpen(true)}
         onOpenProfile={() => setScreen("profile")}
         onOpenDoctor={() => setScreen("doctor")}
+        onOpenHome={() => setScreen("home")}
         onOrderPlaced={(order) => setOrders((o) => [...o, order])}
         externalCartOpen={cartOpen}
         onExternalCartClose={() => setCartOpen(false)}
         hideHeader
         quizFilter={quizFilter}
         onClearQuizFilter={() => setQuizFilter(null)}
+        wishlist={wishlist}
+        onToggleWishlist={toggleWishlist}
+        subscriptions={subscriptions}
+        onSubscribe={subscribeToProduct}
+        initialSearch={catalogSearchSeed}
+        onClearInitialSearch={() => setCatalogSearchSeed(null)}
+        initialCategory={catalogCategorySeed}
+        onClearInitialCategory={() => setCatalogCategorySeed(null)}
+        onOpenDiary={() => setScreen("diary")}
+        initialToast={flashToast}
+        onClearInitialToast={() => setFlashToast(null)}
       />
 
       {configuratorOpen && (
